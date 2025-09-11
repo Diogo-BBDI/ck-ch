@@ -427,10 +427,16 @@ class GoogleSheetsUpdater:
 
 def main():
     """Função principal"""
-    
+
     logger.info("🚀 Iniciando Sistema de Verificação de Estoque Magento")
     logger.info("="*60)
-    
+    logger.info("🔍 Verificando variáveis de ambiente...")
+    logger.info(f"SPREADSHEET_ID: {spreadsheet_id}")
+    logger.info(f"MAGENTO_BASE_URL: {magento_base_url}")
+    logger.info(f"MAGENTO_API_KEY: {magento_api_key[:4]}... (oculta por segurança)")
+    logger.info(f"TEST_MODE: {test_mode}")
+    logger.info(f"BATCH_SIZE: {batch_size}")
+   
     # Lê configurações do ambiente
     spreadsheet_id = os.getenv('SPREADSHEET_ID')
     magento_base_url = os.getenv('MAGENTO_BASE_URL')
