@@ -67,7 +67,7 @@ jobs:
     
     - name: 📁 Upload logs de execução
       if: always()
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: stock-check-logs-${{ github.run_number }}
         path: |
