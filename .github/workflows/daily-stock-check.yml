@@ -5,10 +5,7 @@ name: 🤖 Daily Stock Check - Sistema Magento
 
 on:
   schedule:
-    # Executa todo dia às 09:00 UTC (06:00 BRT)
-    - cron: '0 9 * * *'
-  
-  # Permite execução manual
+    - cron: '0 9 * * *'  # Executa todo dia às 09:00 UTC (06:00 BRT)
   workflow_dispatch:
     inputs:
       test_mode:
@@ -17,9 +14,8 @@ on:
         default: 'false'
         type: choice
         options:
-        - 'true'
-        - 'false'
-      
+          - 'true'
+          - 'false'
       batch_size:
         description: 'Tamanho do batch'
         required: false
@@ -30,29 +26,29 @@ jobs:
     name: 📊 Verificação de Estoque
     runs-on: ubuntu-latest
     timeout-minutes: 300  # 5 horas max
-    
+
     steps:
     - name: 📥 Checkout código
       uses: actions/checkout@v4
-    
+
     - name: 🐍 Configurar Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.9'
         cache: 'pip'
-    
+
     - name: 📦 Instalar dependências
       run: |
         pip install --upgrade pip
-        pip install -r requirements.txt
-    
+        pip install -r requirements.txt --verbose
+
     - name: 🔐 Configurar credenciais Google
       env:
         GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
       run: |
         echo "$GOOGLE_CREDENTIALS" > /tmp/google-credentials.json
         export GOOGLE_APPLICATION_CREDENTIALS=/tmp/google-credentials.json
-    
+
     - name: 📊 Executar verificação de estoque
       env:
         GOOGLE_APPLICATION_CREDENTIALS: /tmp/google-credentials.json
@@ -63,8 +59,8 @@ jobs:
         BATCH_SIZE: ${{ github.event.inputs.batch_size || '50' }}
       run: |
         echo "🚀 Iniciando verificação de estoque..."
-        python main.py
-    
+        python main.py || { echo "❌ Script falhou"; cat *.log; exit 1; }
+
     - name: 📁 Upload logs de execução
       if: always()
       uses: actions/upload-artifact@v4
@@ -74,39 +70,35 @@ jobs:
           *.csv
           *.log
         retention-days: 30
-    
+
     - name: 📧 Notificar resultado (sucesso)
       if: success()
       run: |
         echo "✅ Verificação de estoque concluída com sucesso!"
-        # Aqui você pode adicionar notificações (email, Slack, etc.)
-    
+
     - name: 📧 Notificar resultado (falha)
       if: failure()
       run: |
         echo "❌ Verificação de estoque falhou!"
-        # Aqui você pode adicionar notificações de erro
 
-  # Job para gerar relatório semanal
   weekly-report:
     name: 📈 Relatório Semanal
     runs-on: ubuntu-latest
     if: github.event.schedule == '0 9 * * 1'  # Apenas nas segundas-feiras
     needs: stock-check
-    
+
     steps:
     - name: 📥 Checkout código
       uses: actions/checkout@v4
-    
+
     - name: 🐍 Configurar Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.9'
-    
+
     - name: 📊 Gerar relatório semanal
       run: |
         echo "📈 Gerando relatório semanal..."
-        # Aqui você pode adicionar código para gerar relatórios
         echo "✅ Relatório gerado!"
 
 # Configuração de notificações por email (opcional)
