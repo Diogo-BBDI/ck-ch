@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Sistema de Verificação de Estoque Magento/Adobe Commerce (versão async turbo)
+Sistema de Verificação de Estoque Magento/Adobe Commerce (versão async turbo + retries/chunking)
 - Lê SKUs da aba EstoqueProdutos no Google Sheets
 - Estima estoque via carrinho convidado Magento, de forma assíncrona
-- Escreve os resultados em uma coluna com a data (YYYY-MM-DD)
+- Escreve os resultados em uma coluna com a data (YYYY-MM-DD), com retries e escrita em chunks
 
 Configuração via env (defina no GitHub Actions):
 - GOOGLE_APPLICATION_CREDENTIALS: caminho do JSON da service account
@@ -32,7 +32,7 @@ from googleapiclient.discovery import build
 
 # ================== LOGGING ==================
 logging.basicConfig(
-    level=logging.INFO,  # <- cuidado: INFO (constante), não logging.info (função)
+    level=logging.INFO,  # constante (não use logging.info)
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
@@ -61,6 +61,18 @@ def col_letter(n: int) -> str:
         s = chr(65 + r) + s
     return s
 
+# Retry helper com backoff exponencial para chamadas ao Sheets
+def _with_retry(fn, desc: str, tries: int = 5, backoff: float = 1.5):
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            if i == tries - 1:
+                raise
+            wait = backoff ** i
+            logger.warning(f"{desc} falhou ({e}). Tentando novamente em {wait:.1f}s... [{i+1}/{tries}]")
+            time.sleep(wait)
+
 # ================== GOOGLE SHEETS ==================
 class GoogleSheetsUpdater:
     def __init__(self, spreadsheet_id: str, creds_path: str, input_sheet: str = "EstoqueProdutos"):
@@ -72,12 +84,15 @@ class GoogleSheetsUpdater:
         self.service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 
     def read_products(self, header_row: int = 1) -> List[Dict]:
-        resp = self.service.spreadsheets().values().get(
-            spreadsheetId=self.spreadsheet_id,
-            range=f"{self.input_sheet}!A:ZZ",
-            valueRenderOption="UNFORMATTED_VALUE",
-            dateTimeRenderOption="FORMATTED_STRING",
-        ).execute()
+        resp = _with_retry(
+            lambda: self.service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"{self.input_sheet}!A:ZZ",
+                valueRenderOption="UNFORMATTED_VALUE",
+                dateTimeRenderOption="FORMATTED_STRING",
+            ).execute(num_retries=3),
+            "Sheets GET produtos"
+        )
         values = resp.get("values", [])
         if not values or len(values) <= (header_row - 1):
             logger.warning("Nenhum dado encontrado na planilha.")
@@ -96,17 +111,28 @@ class GoogleSheetsUpdater:
         return products
 
     def write_timeseries_column(self, stocks: List[Optional[int]], date_header: str, header_row: int = 1) -> None:
-        # Lê cabeçalho
-        header_resp = self.service.spreadsheets().values().get(
-            spreadsheetId=self.spreadsheet_id,
-            range=f"{self.input_sheet}!{header_row}:{header_row}",
-            valueRenderOption="UNFORMATTED_VALUE",
-            dateTimeRenderOption="FORMATTED_STRING",
-        ).execute()
+        """
+        Cria/atualiza UMA coluna com cabeçalho = date_header e escreve estoques nas linhas.
+        Faz retries e escreve em chunks (1000 linhas).
+        """
+        if not stocks:
+            logger.info("Sem valores para escrever no Sheets.")
+            return
+
+        # 1) Ler cabeçalho com retry
+        header_resp = _with_retry(
+            lambda: self.service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"{self.input_sheet}!{header_row}:{header_row}",
+                valueRenderOption="UNFORMATTED_VALUE",
+                dateTimeRenderOption="FORMATTED_STRING",
+            ).execute(num_retries=3),
+            "Sheets GET cabeçalho"
+        )
         existing_headers = header_resp.get("values", [[]])
         existing_headers = [str(h).strip() for h in (existing_headers[0] if existing_headers else [])]
 
-        # Verifica se a data já existe no cabeçalho
+        # 2) Descobrir/criar coluna da data
         try:
             col_index = existing_headers.index(date_header) + 1
             creating = False
@@ -116,26 +142,37 @@ class GoogleSheetsUpdater:
 
         col = col_letter(col_index)
 
-        # Se for nova, escreve o cabeçalho
         if creating:
-            self.service.spreadsheets().values().update(
-                spreadsheetId=self.spreadsheet_id,
-                range=f"{self.input_sheet}!{col}{header_row}",
-                valueInputOption="RAW",
-                body={"values": [[date_header]]},
-            ).execute()
+            _with_retry(
+                lambda: self.service.spreadsheets().values().update(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=f"{self.input_sheet}!{col}{header_row}",
+                    valueInputOption="RAW",
+                    body={"values": [[date_header]]},
+                ).execute(num_retries=3),
+                "Sheets UPDATE cabeçalho"
+            )
 
-        # Escreve linhas (da 2 até N)
-        start_row = header_row + 1
-        end_row = start_row + len(stocks) - 1
-        self.service.spreadsheets().values().update(
-            spreadsheetId=self.spreadsheet_id,
-            range=f"{self.input_sheet}!{col}{start_row}:{col}{end_row}",
-            valueInputOption="RAW",
-            body={"values": [[s if s is not None else ""] for s in stocks]},
-        ).execute()
+        # 3) Escrever em CHUNKS (p.ex. 1000 linhas por request)
+        chunk = 1000
+        total = len(stocks)
+        start_row_base = header_row + 1
+        for start in range(0, total, chunk):
+            end = min(start + chunk, total)
+            sub = stocks[start:end]
+            start_row = start_row_base + start
+            end_row = start_row + (end - start) - 1
+            _with_retry(
+                lambda: self.service.spreadsheets().values().update(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=f"{self.input_sheet}!{col}{start_row}:{col}{end_row}",
+                    valueInputOption="RAW",
+                    body={"values": [[s if s is not None else ""] for s in sub]},
+                ).execute(num_retries=3),
+                f"Sheets UPDATE valores linhas {start_row}-{end_row}"
+            )
 
-        logger.info(f"🕒 Coluna '{date_header}' {'criada' if creating else 'atualizada'} ({len(stocks)} linhas)")
+        logger.info(f"🕒 Coluna '{date_header}' {'criada' if creating else 'atualizada'} ({len(stocks)} linhas em chunks)")
 
 # ================== MAGENTO STOCK CHECKER (ASYNC) ==================
 class AsyncMagentoStockChecker:
@@ -152,7 +189,7 @@ class AsyncMagentoStockChecker:
         }
         self.rate_limit = rate_limit
         self.max_stock = max_stock
-        self._max_workers = max_workers  # semaphore será criado dentro do loop
+        self._max_workers = max_workers  # semaphore criado dentro do loop
         self.stats = {"processed": 0, "errors": 0, "start_time": None, "requests": 0}
 
     async def create_cart(self, session: aiohttp.ClientSession, sem: asyncio.Semaphore) -> Optional[str]:
@@ -196,10 +233,10 @@ class AsyncMagentoStockChecker:
                 return 0
 
             valid = 1
-            # Escalada exponencial dinâmica (x4) até o teto
+            # Escalada exponencial dinâmica (x4) limitada a alguns passos
             v = 4
             steps = 0
-            while v <= self.max_stock and steps < 6:  # limita passos iniciais
+            while v <= self.max_stock and steps < 6:
                 await asyncio.sleep(self.rate_limit)
                 if await self.update_item(session, cart_id, item_id, sku, v):
                     valid = v
@@ -208,7 +245,7 @@ class AsyncMagentoStockChecker:
                     break
                 steps += 1
 
-            # Busca binária entre último válido e próximo (ou teto)
+            # Busca binária
             left, right = valid, min(max(valid * 4, valid), self.max_stock)
             iterations = 0
             while left < right and iterations < 6:
@@ -239,9 +276,9 @@ class AsyncMagentoStockChecker:
 
     async def process_all(self, products: List[Dict]) -> List[int]:
         self.stats["start_time"] = time.time()
-        sem = asyncio.Semaphore(self._max_workers)  # ✅ criar dentro do loop
+        sem = asyncio.Semaphore(self._max_workers)  # criado dentro do loop
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=60)
-        connector = aiohttp.TCPConnector(limit=0)  # sem limite interno além do semáforo
+        connector = aiohttp.TCPConnector(limit=0)  # sem limite além do semáforo
         async with aiohttp.ClientSession(headers=self.headers, timeout=timeout, connector=connector) as session:
             tasks = [self.check_stock(session, sem, p["sku"]) for p in products]
             return await asyncio.gather(*tasks, return_exceptions=False)
@@ -281,7 +318,7 @@ def main():
     )
     stocks = asyncio.run(checker.process_all(products))
 
-    # Escreve no Google Sheets (coluna com a data de hoje em UTC)
+    # Escreve no Google Sheets (coluna com a data de hoje em UTC), com retries e chunking
     date_header = datetime.utcnow().strftime("%Y-%m-%d")
     sheets.write_timeseries_column(stocks, date_header)
 
