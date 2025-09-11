@@ -1,4 +1,4 @@
-# Core async HTTP
+# HTTP assíncrono
 aiohttp==3.10.5
 async-timeout==4.0.3
 
@@ -8,11 +8,14 @@ google-auth==2.35.0
 google-auth-httplib2==0.2.0
 google-auth-oauthlib==1.2.1
 
-# Utils
+# Dependências auxiliares do Google client
 httplib2==0.22.0
 uritemplate==4.1.1
 requests==2.32.3
 
-# Logs/encoding
+# Retry avançado (caso queira usar tenacity em vez do _with_retry interno)
+tenacity==9.0.0
+
+# Encoding/compatibilidade
 chardet==5.2.0
 idna==3.8
