@@ -77,6 +77,10 @@ jobs:
       FLUSH_SECONDS: ${{ github.event_name == 'workflow_dispatch' && inputs.flush_seconds || '120' }}
       CHUNK_SIZE: ${{ github.event_name == 'workflow_dispatch' && inputs.chunk_size || '1000' }}
 
+      SOCK_CONNECT_TIMEOUT: '30'
+      SOCK_READ_TIMEOUT: '180'
+
+
     steps:
       - name: 📥 Checkout código
         uses: actions/checkout@v4
