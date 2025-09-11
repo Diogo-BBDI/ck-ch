@@ -111,29 +111,29 @@ jobs:
 
 # Configuração de notificações por email (opcional)
 # Adicione esta seção se quiser receber emails sobre execuções
-notify:
-  name: 📧 Notificações
-  runs-on: ubuntu-latest
-  needs: stock-check
-  if: always()
-  
-  steps:
-  - name: 📧 Enviar email de notificação
-    if: always()
-    uses: dawidd6/action-send-mail@v3
-    with:
-      server_address: smtp.gmail.com
-      server_port: 587
-      username: ${{ secrets.EMAIL_USERNAME }}
-      password: ${{ secrets.EMAIL_PASSWORD }}
-      subject: |
-        ${{ job.status == 'success' && '✅' || '❌' }} Stock Check - ${{ github.run_number }}
-      body: |
-        Status: ${{ job.status }}
-        Workflow: ${{ github.workflow }}
-        Run: ${{ github.run_number }}
-        Timestamp: ${{ github.event.head_commit.timestamp }}
-        
-        ${{ job.status == 'success' && 'Verificação de estoque executada com sucesso!' || 'Falha na verificação de estoque. Verifique os logs.' }}
-      to: seu-email@exemplo.com
-      from: Sistema de Estoque <noreply@exemplo.com>
+# notify:
+#    name: 📧 Notificações
+#    runs-on: ubuntu-latest
+#    needs: stock-check
+#    if: always()
+#    
+#    steps:
+#    - name: 📧 Enviar email de notificação
+#      if: always()
+#      uses: dawidd6/action-send-mail@v3
+#      with:
+#        server_address: smtp.gmail.com
+#        server_port: 587
+#        username: ${{ secrets.EMAIL_USERNAME }}
+#        password: ${{ secrets.EMAIL_PASSWORD }}
+#        subject: |
+#          ${{ job.status == 'success' && '✅' || '❌' }} Stock Check - ${{ github.run_number }}
+#        body: |
+#          Status: ${{ job.status }}
+#          Workflow: ${{ github.workflow }}
+#          Run: ${{ github.run_number }}
+#          Timestamp: ${{ github.event.head_commit.timestamp }}
+          
+#          ${{ job.status == 'success' && 'Verificação de estoque executada com sucesso!' || 'Falha na verificação de estoque. Verifique os logs.' }}
+#        to: seu-email@exemplo.com
+#        from: Sistema de Estoque <noreply@exemplo.com>
