@@ -38,7 +38,7 @@ from googleapiclient.discovery import build
 
 # ================== LOGGING ==================
 logging.basicConfig(
-    level=logging.info,
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
