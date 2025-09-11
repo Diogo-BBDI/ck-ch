@@ -4,7 +4,8 @@ Sistema de Verificação de Estoque Magento/Adobe Commerce
 Versão adaptada para GitHub Actions (cron)
 - Lê SKUs de uma planilha Google (aba EstoqueProdutos)
 - Usa algoritmo otimizado para estimar estoque via carrinho convidado
-- Escreve resultados de volta na planilha, após a última coluna existente
+- Escreve resultados de volta na planilha: cada execução cria/atualiza
+  uma NOVA COLUNA com a data (YYYY-MM-DD) e preenche os estoques nas linhas.
 
 Variáveis de ambiente exigidas:
 - GOOGLE_APPLICATION_CREDENTIALS: caminho do JSON da service account (ex.: /tmp/google-credentials.json)
@@ -16,6 +17,7 @@ Opcional:
 - BATCH_SIZE: inteiro (quantos SKUs processar no teste)
 - RATE_LIMIT: segundos (default 0.3)
 - MAX_WORKERS: inteiro (default 6)
+- MAX_STOCK: teto da busca (default 5000)
 """
 
 import os
@@ -23,20 +25,20 @@ import sys
 import json
 import time
 import logging
-import random
 import concurrent.futures
 from datetime import datetime
 from threading import Lock
 from typing import List, Dict, Optional, Tuple
 
 import requests
-import pandas as pd  # mantido por compatibilidade; ok se não for usado diretamente
+# pandas não é obrigatório aqui; pode ser removido se não usar em outro lugar
+# import pandas as pd
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 # ================== LOGGING ==================
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.info,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
@@ -84,8 +86,8 @@ class GoogleSheetsUpdater:
     Guia esperada: "EstoqueProdutos"
       - Primeira linha = cabeçalho com colunas como: Família | SKU | Título | 2025-09-11 | ...
       - Lemos apenas a coluna "SKU" (case-insensitive).
-      - Escrevemos colunas novas após a última coluna do cabeçalho:
-        status | stock | checked_at | notes
+      - A cada execução, criamos/atualizamos UMA coluna com a data (YYYY-MM-DD),
+        preenchendo os estoques nas linhas (timeseries).
     """
     def __init__(self, spreadsheet_id: str, creds_path: str, input_sheet: str = "EstoqueProdutos", output_sheet: Optional[str] = None):
         self.spreadsheet_id = spreadsheet_id
@@ -149,17 +151,16 @@ class GoogleSheetsUpdater:
         logger.info(f"🧾 Produtos lidos: {len(products)}")
         return products
 
-    def write_results_adjacent(self, results: List[Dict], header_row: int = 1) -> None:
+    def write_timeseries_column(self, stocks_in_order: List[Optional[int]], date_header: str, header_row: int = 1) -> None:
         """
-        Escreve resultados em colunas novas logo APÓS a última coluna do cabeçalho (linha 1).
-        Layout adicionado: status | stock | checked_at | notes
-        As linhas de saída começam na linha 2 e seguem na mesma ordem dos produtos lidos.
+        Acrescenta (ou atualiza) UMA coluna com o cabeçalho = date_header (ex.: '2025-09-11')
+        e preenche somente os estoques nas linhas (alinhadas aos SKUs lidos).
         """
-        if not results:
-            logger.info("Sem resultados para escrever.")
+        if not stocks_in_order:
+            logger.info("Sem valores de estoque para escrever.")
             return
 
-        # 1) Descobre última coluna do cabeçalho
+        # 1) Ler cabeçalho atual
         header_resp = self.service.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
             range=f"{self.output_sheet}!{header_row}:{header_row}",
@@ -167,45 +168,41 @@ class GoogleSheetsUpdater:
             dateTimeRenderOption="FORMATTED_STRING",
         ).execute()
         header_values = header_resp.get("values", [[]])
-        existing_headers = header_values[0] if header_values else []
-        last_col_index = len(existing_headers)  # 1-based start será +1
+        existing_headers = [str(h).strip() for h in (header_values[0] if header_values else [])]
 
-        # 2) Prepara novos cabeçalhos
-        new_headers = ["status", "stock", "checked_at", "notes"]
-        start_idx = last_col_index + 1
-        end_idx = start_idx + len(new_headers) - 1
-        start_col_letter = col_letter(start_idx)
-        end_col_letter = col_letter(end_idx)
+        # 2) Verificar se a data já existe no cabeçalho
+        try:
+            col_index_1based = existing_headers.index(date_header) + 1
+            creating_new = False
+        except ValueError:
+            # Não existe -> criar no fim
+            col_index_1based = len(existing_headers) + 1
+            creating_new = True
 
-        # 3) Escreve cabeçalhos
-        self.service.spreadsheets().values().update(
-            spreadsheetId=self.spreadsheet_id,
-            range=f"{self.output_sheet}!{start_col_letter}{header_row}:{end_col_letter}{header_row}",
-            valueInputOption="RAW",
-            body={"values": [new_headers]},
-        ).execute()
+        col_letter_str = col_letter(col_index_1based)
 
-        # 4) Monta linhas (uma por resultado)
-        write_values = []
-        for r in results:
-            write_values.append([
-                r.get("status", ""),
-                r.get("stock", ""),
-                r.get("checked_at", ""),
-                r.get("notes", "")
-            ])
+        # 3) Se for nova, escrever o cabeçalho (somente a célula do cabeçalho)
+        if creating_new:
+            self.service.spreadsheets().values().update(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"{self.output_sheet}!{col_letter_str}{header_row}",
+                valueInputOption="RAW",
+                body={"values": [[date_header]]},
+            ).execute()
 
-        # 5) Escreve as linhas (a partir da 2)
+        # 4) Escrever os estoques na coluna (da linha 2 até N)
+        values = [[s if s is not None else ""] for s in stocks_in_order]
         start_row = header_row + 1
-        end_row = header_row + len(write_values)
+        end_row = start_row + len(values) - 1
         self.service.spreadsheets().values().update(
             spreadsheetId=self.spreadsheet_id,
-            range=f"{self.output_sheet}!{start_col_letter}{start_row}:{end_col_letter}{end_row}",
+            range=f"{self.output_sheet}!{col_letter_str}{start_row}:{col_letter_str}{end_row}",
             valueInputOption="RAW",
-            body={"values": write_values},
+            body={"values": values},
         ).execute()
 
-        logger.info(f"📝 Resultados escritos em {self.output_sheet}!{start_col_letter}{start_row}:{end_col_letter}{end_row}")
+        action = "criadas" if creating_new else "atualizadas"
+        logger.info(f"🕒 Coluna '{date_header}' {action} em {self.output_sheet}!{col_letter_str}{header_row}:{col_letter_str}{end_row}")
 
 # ================== MAGENTO STOCK CHECKER ==================
 class MagentoStockChecker:
@@ -240,11 +237,14 @@ class MagentoStockChecker:
         # Config de performance via env
         self.rate_limit = float(os.getenv("RATE_LIMIT", "0.3"))
         self.max_workers = int(os.getenv("MAX_WORKERS", "6"))
+        # teto configurável (default 5000)
+        self.max_stock = int(os.getenv("MAX_STOCK", "5000"))
 
         logger.info("✅ MagentoStockChecker inicializado")
         logger.info(f"🌐 URL: {self.base_url}")
         logger.info(f"⚡ Max workers: {self.max_workers}")
         logger.info(f"⏱️ Rate limit: {self.rate_limit}s")
+        logger.info(f"📈 MAX_STOCK: {self.max_stock}")
 
     # ---------- Carrinho ----------
     def create_cart(self) -> Optional[str]:
@@ -328,9 +328,16 @@ class MagentoStockChecker:
                 self.return_cart(cart_id)
                 return 0
 
-            # 2) busca exponencial
+            # 2) busca exponencial dinâmica (multiplica por 4 até chegar perto do teto)
             valid_stock = 1
-            test_values = [max(hint, 4), 16, 64, 256]
+            test_values: List[int] = []
+            v = max(int(hint) if hint else 1, 4)
+            steps = 0
+            while v <= self.max_stock and steps < 6:  # limita ~6 passos para não abusar da API
+                test_values.append(v)
+                v *= 4
+                steps += 1
+
             for test_qty in test_values:
                 time.sleep(self.rate_limit)
                 if self.update_item_qty(cart_id, item_id, sku, test_qty):
@@ -338,10 +345,10 @@ class MagentoStockChecker:
                 else:
                     break
 
-            # 3) busca binária
-            left, right = valid_stock, min(valid_stock * 4, 9999)
+            # 3) busca binária entre o último válido e o próximo (ou até o teto)
+            left, right = valid_stock, min(max(valid_stock * 4, valid_stock), self.max_stock)
             iterations = 0
-            while left < right and iterations < 5:
+            while left < right and iterations < 6:
                 mid = (left + right + 1) // 2
                 time.sleep(self.rate_limit)
                 if self.update_item_qty(cart_id, item_id, sku, mid):
@@ -351,8 +358,8 @@ class MagentoStockChecker:
                     right = mid - 1
                 iterations += 1
 
-            # 4) teste final +1
-            if valid_stock < 9999:
+            # 4) teste final +1 (se ainda abaixo do teto)
+            if valid_stock < self.max_stock:
                 time.sleep(self.rate_limit)
                 if self.update_item_qty(cart_id, item_id, sku, valid_stock + 1):
                     valid_stock += 1
@@ -385,24 +392,12 @@ class MagentoStockChecker:
             try:
                 stock = self.check_stock_optimized(sku, hint)
                 self.stats["processed"] += 1
-                return {
-                    "sku": sku,
-                    "stock": stock,
-                    "status": "OK",
-                    "checked_at": now_ts_iso(),
-                    "notes": ""
-                }
+                return {"sku": sku, "stock": stock}
             except Exception as e:
                 self.stats["processed"] += 1
                 self.stats["errors"] += 1
                 logger.exception(f"Falha ao processar SKU {sku}")
-                return {
-                    "sku": sku,
-                    "stock": "",
-                    "status": "ERROR",
-                    "checked_at": now_ts_iso(),
-                    "notes": str(e)
-                }
+                return {"sku": sku, "stock": ""}
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = [executor.submit(process_single, p) for p in products]
@@ -467,22 +462,16 @@ def main():
         products = products[:batch_size]
         logger.info(f"🧪 TEST_MODE ativo: processando {len(products)} produtos")
 
-    # Embaralha levemente para evitar burst em SKUs sequenciais
-    random.shuffle(products)
-
-    # Processa
+    # NÃO embaralhar — manter a ordem da planilha
     results = checker.process_batch(products)
 
-    # Realinha resultados na mesma ordem da leitura (garantia)
-    sku_to_result = {r["sku"]: r for r in results}
-    aligned_results = []
-    for p in products:
-        aligned_results.append(sku_to_result.get(p["sku"], {
-            "sku": p["sku"], "status": "MISSING", "stock": "", "checked_at": now_ts_iso(), "notes": "sem retorno"
-        }))
+    # Extrai apenas os estoques, na MESMA ORDEM dos produtos lidos
+    sku_to_stock = {r["sku"]: r.get("stock", "") for r in results}
+    stocks_in_order = [sku_to_stock.get(p["sku"], "") for p in products]
 
-    # Escreve na planilha após a última coluna existente
-    sheets.write_results_adjacent(aligned_results, header_row=1)
+    # Cabeçalho da coluna = data da checagem (YYYY-MM-DD, UTC)
+    date_header = datetime.utcnow().strftime("%Y-%m-%d")
+    sheets.write_timeseries_column(stocks_in_order, date_header=date_header, header_row=1)
 
     # Resumo
     elapsed = time.time() - checker.stats["start_time"]
