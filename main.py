@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Sistema de Verificação de Estoque Magento/Adobe Commerce (versão async turbo + retries/chunking)
+Sistema de Verificação de Estoque Magento/Adobe Commerce (async turbo + tenacity)
 - Lê SKUs da aba EstoqueProdutos no Google Sheets
-- Estima estoque via carrinho convidado Magento, de forma assíncrona
-- Escreve os resultados em uma coluna com a data (YYYY-MM-DD), com retries e escrita em chunks
+- Estima estoque via carrinho convidado Magento, de forma assíncrona (aiohttp)
+- Escreve os resultados em uma coluna com a data (YYYY-MM-DD),
+  com retries (tenacity) e escrita em chunks
 
-Configuração via env (defina no GitHub Actions):
+ENV no GitHub Actions:
 - GOOGLE_APPLICATION_CREDENTIALS: caminho do JSON da service account
 - SPREADSHEET_ID: ID da planilha
 - MAGENTO_API_KEY: chave da API
@@ -27,8 +28,11 @@ from datetime import datetime
 from typing import List, Dict, Optional
 
 import aiohttp
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # ================== LOGGING ==================
 logging.basicConfig(
@@ -61,17 +65,23 @@ def col_letter(n: int) -> str:
         s = chr(65 + r) + s
     return s
 
-# Retry helper com backoff exponencial para chamadas ao Sheets
-def _with_retry(fn, desc: str, tries: int = 5, backoff: float = 1.5):
-    for i in range(tries):
-        try:
-            return fn()
-        except Exception as e:
-            if i == tries - 1:
-                raise
-            wait = backoff ** i
-            logger.warning(f"{desc} falhou ({e}). Tentando novamente em {wait:.1f}s... [{i+1}/{tries}]")
-            time.sleep(wait)
+# ================== TENACITY HELPERS PARA GOOGLE SHEETS ==================
+# Retenta HttpError (4xx/5xx transitórios), BrokenPipe/IO, etc.
+RETRIABLE_EXCEPTIONS = (HttpError, BrokenPipeError, OSError, ConnectionError, TimeoutError)
+
+def _describe_retry(retry_state):
+    e = retry_state.outcome.exception() if retry_state.outcome else None
+    if e:
+        logger.warning(f"Sheets falhou: {type(e).__name__}: {e}. Tentando novamente... (tentativa {retry_state.attempt_number})")
+
+def _retry_decorator():
+    return retry(
+        reraise=True,
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type(RETRIABLE_EXCEPTIONS),
+        before_sleep=_describe_retry,
+    )
 
 # ================== GOOGLE SHEETS ==================
 class GoogleSheetsUpdater:
@@ -83,16 +93,26 @@ class GoogleSheetsUpdater:
         creds = service_account.Credentials.from_service_account_file(creds_path, scopes=scopes)
         self.service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 
+    @_retry_decorator()
+    def _values_get(self, range_str: str, valueRenderOption="UNFORMATTED_VALUE", dateTimeRenderOption="FORMATTED_STRING"):
+        return self.service.spreadsheets().values().get(
+            spreadsheetId=self.spreadsheet_id,
+            range=range_str,
+            valueRenderOption=valueRenderOption,
+            dateTimeRenderOption=dateTimeRenderOption,
+        ).execute(num_retries=3)
+
+    @_retry_decorator()
+    def _values_update(self, range_str: str, values: List[List[object]], valueInputOption="RAW"):
+        return self.service.spreadsheets().values().update(
+            spreadsheetId=self.spreadsheet_id,
+            range=range_str,
+            valueInputOption=valueInputOption,
+            body={"values": values},
+        ).execute(num_retries=3)
+
     def read_products(self, header_row: int = 1) -> List[Dict]:
-        resp = _with_retry(
-            lambda: self.service.spreadsheets().values().get(
-                spreadsheetId=self.spreadsheet_id,
-                range=f"{self.input_sheet}!A:ZZ",
-                valueRenderOption="UNFORMATTED_VALUE",
-                dateTimeRenderOption="FORMATTED_STRING",
-            ).execute(num_retries=3),
-            "Sheets GET produtos"
-        )
+        resp = self._values_get(f"{self.input_sheet}!A:ZZ")
         values = resp.get("values", [])
         if not values or len(values) <= (header_row - 1):
             logger.warning("Nenhum dado encontrado na planilha.")
@@ -113,22 +133,14 @@ class GoogleSheetsUpdater:
     def write_timeseries_column(self, stocks: List[Optional[int]], date_header: str, header_row: int = 1) -> None:
         """
         Cria/atualiza UMA coluna com cabeçalho = date_header e escreve estoques nas linhas.
-        Faz retries e escreve em chunks (1000 linhas).
+        Usa tenacity para retry e escreve em chunks (1000 linhas).
         """
         if not stocks:
             logger.info("Sem valores para escrever no Sheets.")
             return
 
-        # 1) Ler cabeçalho com retry
-        header_resp = _with_retry(
-            lambda: self.service.spreadsheets().values().get(
-                spreadsheetId=self.spreadsheet_id,
-                range=f"{self.input_sheet}!{header_row}:{header_row}",
-                valueRenderOption="UNFORMATTED_VALUE",
-                dateTimeRenderOption="FORMATTED_STRING",
-            ).execute(num_retries=3),
-            "Sheets GET cabeçalho"
-        )
+        # 1) Cabeçalho com retry
+        header_resp = self._values_get(f"{self.input_sheet}!{header_row}:{header_row}")
         existing_headers = header_resp.get("values", [[]])
         existing_headers = [str(h).strip() for h in (existing_headers[0] if existing_headers else [])]
 
@@ -141,19 +153,10 @@ class GoogleSheetsUpdater:
             creating = True
 
         col = col_letter(col_index)
-
         if creating:
-            _with_retry(
-                lambda: self.service.spreadsheets().values().update(
-                    spreadsheetId=self.spreadsheet_id,
-                    range=f"{self.input_sheet}!{col}{header_row}",
-                    valueInputOption="RAW",
-                    body={"values": [[date_header]]},
-                ).execute(num_retries=3),
-                "Sheets UPDATE cabeçalho"
-            )
+            self._values_update(f"{self.input_sheet}!{col}{header_row}", [[date_header]])
 
-        # 3) Escrever em CHUNKS (p.ex. 1000 linhas por request)
+        # 3) Escrever em chunks
         chunk = 1000
         total = len(stocks)
         start_row_base = header_row + 1
@@ -162,14 +165,9 @@ class GoogleSheetsUpdater:
             sub = stocks[start:end]
             start_row = start_row_base + start
             end_row = start_row + (end - start) - 1
-            _with_retry(
-                lambda: self.service.spreadsheets().values().update(
-                    spreadsheetId=self.spreadsheet_id,
-                    range=f"{self.input_sheet}!{col}{start_row}:{col}{end_row}",
-                    valueInputOption="RAW",
-                    body={"values": [[s if s is not None else ""] for s in sub]},
-                ).execute(num_retries=3),
-                f"Sheets UPDATE valores linhas {start_row}-{end_row}"
+            self._values_update(
+                f"{self.input_sheet}!{col}{start_row}:{col}{end_row}",
+                [[s if s is not None else ""] for s in sub]
             )
 
         logger.info(f"🕒 Coluna '{date_header}' {'criada' if creating else 'atualizada'} ({len(stocks)} linhas em chunks)")
@@ -318,7 +316,7 @@ def main():
     )
     stocks = asyncio.run(checker.process_all(products))
 
-    # Escreve no Google Sheets (coluna com a data de hoje em UTC), com retries e chunking
+    # Escreve no Google Sheets (coluna com a data de hoje em UTC), com retries + chunking
     date_header = datetime.utcnow().strftime("%Y-%m-%d")
     sheets.write_timeseries_column(stocks, date_header)
 
