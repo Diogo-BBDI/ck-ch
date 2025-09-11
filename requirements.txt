@@ -1,0 +1,26 @@
+# requirements.txt
+# Dependências do Sistema de Verificação de Estoque Magento
+
+# Core dependencies
+requests==2.31.0
+pandas==2.0.3
+
+# Google APIs
+google-auth==2.23.0
+google-auth-oauthlib==1.0.0
+google-auth-httplib2==0.1.0
+google-api-python-client==2.100.0
+
+# Threading and async
+concurrent-futures==3.1.1
+
+# Utilities
+python-dateutil==2.8.2
+urllib3==2.0.4
+
+# Optional: Para análises adicionais
+matplotlib==3.7.2
+seaborn==0.12.2
+
+# Optional: Para notificações
+smtplib-ssl==1.0.0
