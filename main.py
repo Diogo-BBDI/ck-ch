@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
 """
-Sistema de Verificação de Estoque Magento/Adobe Commerce (async turbo + tenacity + incremental write)
-- Lê SKUs da aba EstoqueProdutos no Google Sheets
-- Estima estoque via carrinho convidado Magento, de forma assíncrona (aiohttp)
-- Escreve os resultados em uma coluna com a data (YYYY-MM-DD),
-  com retries (tenacity), escrita em chunks e escrita incremental opcional
+Sistema de Verificação de Estoque Magento/Adobe Commerce
+- Async turbo (aiohttp) para máximo throughput
+- Retries com tenacity (Google Sheets e Magento)
+- Timeouts configuráveis (SOCK_CONNECT_TIMEOUT, SOCK_READ_TIMEOUT)
+- Escrita incremental opcional no Google Sheets (INCREMENTAL_WRITE=true)
+- Escrita final em chunks (CHUNK_SIZE, default 1000)
 
 ENV no GitHub Actions:
 - GOOGLE_APPLICATION_CREDENTIALS: caminho do JSON da service account
-- SPREADSHEET_ID: ID da planilha
-- MAGENTO_API_KEY: chave da API
-- MAGENTO_BASE_URL: base da loja
-- MAX_WORKERS: concorrência máxima (default 20)
-- RATE_LIMIT: intervalo mínimo entre chamadas (default 0.1s)
+- SPREADSHEET_ID: ID da planilha (secrets)
+- MAGENTO_API_KEY: chave da API (secrets)
+- MAGENTO_BASE_URL: base da loja (secrets)
+- MAX_WORKERS: concorrência (default 20)
+- RATE_LIMIT: intervalo entre tentativas do algoritmo (default 0.1s)
 - MAX_STOCK: teto de busca (default 5000)
 - TEST_MODE: "true"/"false"
-- BATCH_SIZE: limite de SKUs no modo teste
+- BATCH_SIZE: limite de SKUs quando TEST_MODE=true
 - INCREMENTAL_WRITE: "true"/"false" (default false)
 - FLUSH_EVERY: int (default 500)
 - FLUSH_SECONDS: int (default 120)
 - CHUNK_SIZE: int (default 1000)
+- SOCK_CONNECT_TIMEOUT: seg (default 30)
+- SOCK_READ_TIMEOUT: seg (default 180)
 """
 
 import os
 import sys
-import json
 import time
 import asyncio
 import logging
@@ -40,7 +42,7 @@ from googleapiclient.errors import HttpError
 
 # ================== LOGGING ==================
 logging.basicConfig(
-    level=logging.INFO,  # constante (não use logging.info)
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
@@ -69,21 +71,31 @@ def col_letter(n: int) -> str:
         s = chr(65 + r) + s
     return s
 
-# ================== TENACITY HELPERS PARA GOOGLE SHEETS ==================
-RETRIABLE_EXCEPTIONS = (HttpError, BrokenPipeError, OSError, ConnectionError, TimeoutError)
+# ================== TENACITY HELPERS ==================
+# Google Sheets retries
+GS_RETRIABLE_EXC = (HttpError, BrokenPipeError, OSError, ConnectionError, TimeoutError)
 
-def _describe_retry(retry_state):
-    e = retry_state.outcome.exception() if retry_state.outcome else None
-    if e:
-        logger.warning(f"Sheets falhou: {type(e).__name__}: {e}. Tentando novamente... (tentativa {retry_state.attempt_number})")
-
-def _retry_decorator():
+def _gs_retry():
     return retry(
         reraise=True,
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type(RETRIABLE_EXCEPTIONS),
-        before_sleep=_describe_retry,
+        retry=retry_if_exception_type(GS_RETRIABLE_EXC),
+        before_sleep=lambda rs: logger.warning(
+            f"Sheets falhou: {type(rs.outcome.exception()).__name__}: {rs.outcome.exception()} "
+            f"(tentativa {rs.attempt_number})"
+        ),
+    )
+
+# Magento retries
+MG_RETRIABLE_EXC = (aiohttp.ClientError, asyncio.TimeoutError, OSError)
+
+def _mg_retry():
+    return retry(
+        reraise=True,
+        stop=stop_after_attempt(4),  # 1 + 3 retries
+        wait=wait_exponential(multiplier=1, min=1, max=8),
+        retry=retry_if_exception_type(MG_RETRIABLE_EXC),
     )
 
 # ================== GOOGLE SHEETS ==================
@@ -96,7 +108,7 @@ class GoogleSheetsUpdater:
         creds = service_account.Credentials.from_service_account_file(creds_path, scopes=scopes)
         self.service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 
-    @_retry_decorator()
+    @_gs_retry()
     def _values_get(self, range_str: str, valueRenderOption="UNFORMATTED_VALUE", dateTimeRenderOption="FORMATTED_STRING"):
         return self.service.spreadsheets().values().get(
             spreadsheetId=self.spreadsheet_id,
@@ -105,7 +117,7 @@ class GoogleSheetsUpdater:
             dateTimeRenderOption=dateTimeRenderOption,
         ).execute(num_retries=3)
 
-    @_retry_decorator()
+    @_gs_retry()
     def _values_update(self, range_str: str, values: List[List[object]], valueInputOption="RAW"):
         return self.service.spreadsheets().values().update(
             spreadsheetId=self.spreadsheet_id,
@@ -134,9 +146,6 @@ class GoogleSheetsUpdater:
         return products
 
     def ensure_date_column(self, date_header: str, header_row: int = 1) -> Tuple[str, bool]:
-        """
-        Garante que a coluna com o cabeçalho date_header existe. Retorna (col_letter, created).
-        """
         header_resp = self._values_get(f"{self.input_sheet}!{header_row}:{header_row}")
         existing_headers = header_resp.get("values", [[]])
         existing_headers = [str(h).strip() for h in (existing_headers[0] if existing_headers else [])]
@@ -149,16 +158,11 @@ class GoogleSheetsUpdater:
             created = True
 
         col = col_letter(col_index)
-
         if created:
             self._values_update(f"{self.input_sheet}!{col}{header_row}", [[date_header]])
-
         return col, created
 
     def update_column_range_chunked(self, col: str, header_row: int, start_row: int, values_1col: List[object], chunk_size: int = 1000) -> None:
-        """
-        Escreve uma lista vertical (1 coluna) em blocos na coluna 'col', iniciando em 'start_row' (1-based).
-        """
         total = len(values_1col)
         if total == 0:
             return
@@ -173,9 +177,6 @@ class GoogleSheetsUpdater:
             )
 
     def write_timeseries_column_all(self, stocks: List[Optional[int]], date_header: str, header_row: int = 1, chunk_size: int = 1000) -> None:
-        """
-        Escreve toda a coluna (final) de uma vez em chunks.
-        """
         col, created = self.ensure_date_column(date_header, header_row)
         start_row = header_row + 1
         self.update_column_range_chunked(col, header_row, start_row, stocks, chunk_size)
@@ -199,33 +200,45 @@ class AsyncMagentoStockChecker:
         self._max_workers = max_workers  # semaphore criado dentro do loop
         self.stats = {"processed": 0, "errors": 0, "start_time": None, "requests": 0}
 
+    @_mg_retry()
     async def create_cart(self, session: aiohttp.ClientSession, sem: asyncio.Semaphore) -> Optional[str]:
         async with sem:
             async with session.post(f"{self.base_url}/rest/V1/guest-carts") as r:
                 self.stats["requests"] += 1
+                if r.status in (429, 500, 502, 503, 504):
+                    raise aiohttp.ClientError(f"HTTP {r.status} em create_cart")
                 if r.status == 200:
                     return (await r.text()).strip('"')
                 return None
 
+    @_mg_retry()
     async def add_item(self, session: aiohttp.ClientSession, cart_id: str, sku: str, qty: int):
         payload = {"cartItem": {"quoteId": cart_id, "sku": sku, "qty": qty}}
         async with session.post(f"{self.base_url}/rest/V1/guest-carts/{cart_id}/items", json=payload) as r:
             self.stats["requests"] += 1
+            if r.status in (429, 500, 502, 503, 504):
+                raise aiohttp.ClientError(f"HTTP {r.status} em add_item")
             if r.status == 200:
                 data = await r.json()
                 return True, data.get("item_id") or data.get("itemId")
             return False, None
 
+    @_mg_retry()
     async def update_item(self, session: aiohttp.ClientSession, cart_id: str, item_id: str, sku: str, qty: int) -> bool:
         payload = {"cartItem": {"item_id": item_id, "quote_id": cart_id, "sku": sku, "qty": qty}}
         async with session.put(f"{self.base_url}/rest/V1/guest-carts/{cart_id}/items/{item_id}", json=payload) as r:
             self.stats["requests"] += 1
+            if r.status in (429, 500, 502, 503, 504):
+                raise aiohttp.ClientError(f"HTTP {r.status} em update_item")
             return r.status == 200
 
+    @_mg_retry()
     async def delete_item(self, session: aiohttp.ClientSession, cart_id: str, item_id: str):
         try:
             async with session.delete(f"{self.base_url}/rest/V1/guest-carts/{cart_id}/items/{item_id}") as r:
                 self.stats["requests"] += 1
+                if r.status in (429, 500, 502, 503, 504):
+                    raise aiohttp.ClientError(f"HTTP {r.status} em delete_item")
         except:
             pass
 
@@ -240,7 +253,7 @@ class AsyncMagentoStockChecker:
                 return 0
 
             valid = 1
-            # Escalada exponencial dinâmica (x4) limitada a alguns passos
+            # Escalada exponencial (x4) limitada a alguns passos
             v = 4
             steps = 0
             while v <= self.max_stock and steps < 6:
@@ -281,13 +294,25 @@ class AsyncMagentoStockChecker:
         finally:
             self.stats["processed"] += 1
 
-    async def process_all_incremental(self, products: List[Dict], sheets: "GoogleSheetsUpdater", date_header: str, header_row: int, chunk_size: int, incremental: bool, flush_every: int, flush_seconds: int) -> List[int]:
+    async def process_all_incremental(
+        self,
+        products: List[Dict],
+        sheets: "GoogleSheetsUpdater",
+        date_header: str,
+        header_row: int,
+        chunk_size: int,
+        incremental: bool,
+        flush_every: int,
+        flush_seconds: int,
+        sock_connect_timeout: float = 30,
+        sock_read_timeout: float = 180,
+    ) -> List[int]:
         """
         Processa todos os produtos com escrita incremental opcional.
         """
         self.stats["start_time"] = time.time()
         sem = asyncio.Semaphore(self._max_workers)
-        timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=60)
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=sock_connect_timeout, sock_read=sock_read_timeout)
         connector = aiohttp.TCPConnector(limit=0)
 
         # Garante a coluna já criada e pega a letra
@@ -300,7 +325,6 @@ class AsyncMagentoStockChecker:
         last_flushed_index = -1  # maior índice contíguo já escrito
 
         async with aiohttp.ClientSession(headers=self.headers, timeout=timeout, connector=connector) as session:
-            # cria tasks indexadas
             async def runner(idx: int, sku: str):
                 val = await self.check_stock(session, sem, sku)
                 stocks[idx] = val
@@ -309,9 +333,6 @@ class AsyncMagentoStockChecker:
             tasks = [asyncio.create_task(runner(i, p["sku"])) for i, p in enumerate(products)]
 
             async def contiguous_prefix_max() -> int:
-                """
-                Retorna o maior índice k tal que todos 0..k estão concluídos.
-                """
                 k = last_flushed_index
                 while (k + 1) < len(stocks) and ((k + 1) in done_idx):
                     k += 1
@@ -326,7 +347,6 @@ class AsyncMagentoStockChecker:
                 if force or time_ok or count_ok:
                     k = await contiguous_prefix_max()
                     if k > last_flushed_index:
-                        # escreve do próximo após o último flush até k
                         start_row = start_row_base + (last_flushed_index + 1)
                         block = stocks[(last_flushed_index + 1):(k + 1)]
                         sheets.update_column_range_chunked(col, header_row, start_row, block, chunk_size)
@@ -334,17 +354,13 @@ class AsyncMagentoStockChecker:
                         last_flush_time = time.time()
                         logger.info(f"📝 Flush incremental: linhas {start_row}..{start_row + len(block) - 1} (prefixo contíguo {k+1}/{len(stocks)})")
 
-            # consume completions e faz flushes periódicos
             for coro in asyncio.as_completed(tasks):
                 await coro
-                # flush por contagem/tempo
                 await maybe_flush(force=False)
 
-            # flush final (qualquer restante)
             await maybe_flush(force=True)
 
-        # Preenche None com "" para escrita final
-        return [ (x if x is not None else "") for x in stocks ]
+        return [(x if x is not None else "") for x in stocks]
 
 # ================== MAIN ==================
 def main():
@@ -363,6 +379,8 @@ def main():
     flush_every = int(os.getenv("FLUSH_EVERY", "500"))
     flush_seconds = int(os.getenv("FLUSH_SECONDS", "120"))
     chunk_size = int(os.getenv("CHUNK_SIZE", "1000"))
+    sock_connect_timeout = float(os.getenv("SOCK_CONNECT_TIMEOUT", "30"))
+    sock_read_timeout = float(os.getenv("SOCK_READ_TIMEOUT", "180"))
 
     logger.info("🚀 Iniciando Sistema de Verificação de Estoque Magento")
     logger.info(f"SPREADSHEET_ID: {mask(spreadsheet_id)}")
@@ -370,6 +388,7 @@ def main():
     logger.info(f"TEST_MODE: {test_mode} | BATCH_SIZE: {batch_size}")
     logger.info(f"⚡ Max workers: {max_workers} | ⏱️ Rate limit: {rate_limit}s | 📈 MAX_STOCK: {max_stock}")
     logger.info(f"🧾 Incremental: {incremental} | FLUSH_EVERY={flush_every} | FLUSH_SECONDS={flush_seconds} | CHUNK_SIZE={chunk_size}")
+    logger.info(f"⏳ Timeouts: connect={sock_connect_timeout}s, read={sock_read_timeout}s")
 
     sheets = GoogleSheetsUpdater(spreadsheet_id, creds_path)
     products = sheets.read_products()
@@ -387,7 +406,6 @@ def main():
     )
 
     date_header = datetime.utcnow().strftime("%Y-%m-%d")
-    # Processa com incremental e retorna todos os estoques (com gaps preenchidos como "")
     stocks = asyncio.run(
         checker.process_all_incremental(
             products, sheets, date_header,
@@ -395,11 +413,13 @@ def main():
             chunk_size=chunk_size,
             incremental=incremental,
             flush_every=flush_every,
-            flush_seconds=flush_seconds
+            flush_seconds=flush_seconds,
+            sock_connect_timeout=sock_connect_timeout,
+            sock_read_timeout=sock_read_timeout,
         )
     )
 
-    # Escrita final (garante que tudo ficou persistido; reusa a mesma coluna)
+    # Escrita final (garante consistência total)
     sheets.write_timeseries_column_all(stocks, date_header, header_row=1, chunk_size=chunk_size)
 
     elapsed = time.time() - checker.stats["start_time"]
