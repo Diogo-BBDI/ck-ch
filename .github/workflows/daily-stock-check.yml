@@ -5,7 +5,7 @@ name: 🤖 Daily Stock Check - Sistema Magento
 
 on:
   schedule:
-    - cron: '0 9 * * *'  # Executa todo dia às 09:00 UTC (06:00 BRT)
+  - cron: '0 7 * * *'  # Executa todo dia às 09:00 UTC (06:00 BRT)
   workflow_dispatch:
     inputs:
       test_mode:
