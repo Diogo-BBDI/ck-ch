@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Sistema de Verificação de Estoque Magento/Adobe Commerce (async turbo + tenacity)
+Sistema de Verificação de Estoque Magento/Adobe Commerce (async turbo + tenacity + incremental write)
 - Lê SKUs da aba EstoqueProdutos no Google Sheets
 - Estima estoque via carrinho convidado Magento, de forma assíncrona (aiohttp)
 - Escreve os resultados em uma coluna com a data (YYYY-MM-DD),
-  com retries (tenacity) e escrita em chunks
+  com retries (tenacity), escrita em chunks e escrita incremental opcional
 
 ENV no GitHub Actions:
 - GOOGLE_APPLICATION_CREDENTIALS: caminho do JSON da service account
@@ -16,6 +16,10 @@ ENV no GitHub Actions:
 - MAX_STOCK: teto de busca (default 5000)
 - TEST_MODE: "true"/"false"
 - BATCH_SIZE: limite de SKUs no modo teste
+- INCREMENTAL_WRITE: "true"/"false" (default false)
+- FLUSH_EVERY: int (default 500)
+- FLUSH_SECONDS: int (default 120)
+- CHUNK_SIZE: int (default 1000)
 """
 
 import os
@@ -25,7 +29,7 @@ import time
 import asyncio
 import logging
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import aiohttp
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -66,7 +70,6 @@ def col_letter(n: int) -> str:
     return s
 
 # ================== TENACITY HELPERS PARA GOOGLE SHEETS ==================
-# Retenta HttpError (4xx/5xx transitórios), BrokenPipe/IO, etc.
 RETRIABLE_EXCEPTIONS = (HttpError, BrokenPipeError, OSError, ConnectionError, TimeoutError)
 
 def _describe_retry(retry_state):
@@ -130,47 +133,53 @@ class GoogleSheetsUpdater:
         logger.info(f"🧾 Produtos lidos: {len(products)}")
         return products
 
-    def write_timeseries_column(self, stocks: List[Optional[int]], date_header: str, header_row: int = 1) -> None:
+    def ensure_date_column(self, date_header: str, header_row: int = 1) -> Tuple[str, bool]:
         """
-        Cria/atualiza UMA coluna com cabeçalho = date_header e escreve estoques nas linhas.
-        Usa tenacity para retry e escreve em chunks (1000 linhas).
+        Garante que a coluna com o cabeçalho date_header existe. Retorna (col_letter, created).
         """
-        if not stocks:
-            logger.info("Sem valores para escrever no Sheets.")
-            return
-
-        # 1) Cabeçalho com retry
         header_resp = self._values_get(f"{self.input_sheet}!{header_row}:{header_row}")
         existing_headers = header_resp.get("values", [[]])
         existing_headers = [str(h).strip() for h in (existing_headers[0] if existing_headers else [])]
 
-        # 2) Descobrir/criar coluna da data
         try:
             col_index = existing_headers.index(date_header) + 1
-            creating = False
+            created = False
         except ValueError:
             col_index = len(existing_headers) + 1
-            creating = True
+            created = True
 
         col = col_letter(col_index)
-        if creating:
+
+        if created:
             self._values_update(f"{self.input_sheet}!{col}{header_row}", [[date_header]])
 
-        # 3) Escrever em chunks
-        chunk = 1000
-        total = len(stocks)
-        start_row_base = header_row + 1
-        for start in range(0, total, chunk):
-            end = min(start + chunk, total)
-            sub = stocks[start:end]
-            start_row = start_row_base + start
-            end_row = start_row + (end - start) - 1
+        return col, created
+
+    def update_column_range_chunked(self, col: str, header_row: int, start_row: int, values_1col: List[object], chunk_size: int = 1000) -> None:
+        """
+        Escreve uma lista vertical (1 coluna) em blocos na coluna 'col', iniciando em 'start_row' (1-based).
+        """
+        total = len(values_1col)
+        if total == 0:
+            return
+        for start in range(0, total, chunk_size):
+            end = min(start + chunk_size, total)
+            sub = values_1col[start:end]
+            sr = start_row + start
+            er = sr + (end - start) - 1
             self._values_update(
-                f"{self.input_sheet}!{col}{start_row}:{col}{end_row}",
-                [[s if s is not None else ""] for s in sub]
+                f"{self.input_sheet}!{col}{sr}:{col}{er}",
+                [[v if v is not None else ""] for v in sub]
             )
 
-        logger.info(f"🕒 Coluna '{date_header}' {'criada' if creating else 'atualizada'} ({len(stocks)} linhas em chunks)")
+    def write_timeseries_column_all(self, stocks: List[Optional[int]], date_header: str, header_row: int = 1, chunk_size: int = 1000) -> None:
+        """
+        Escreve toda a coluna (final) de uma vez em chunks.
+        """
+        col, created = self.ensure_date_column(date_header, header_row)
+        start_row = header_row + 1
+        self.update_column_range_chunked(col, header_row, start_row, stocks, chunk_size)
+        logger.info(f"🕒 Coluna '{date_header}' {'criada' if created else 'atualizada'} ({len(stocks)} linhas em chunks)")
 
 # ================== MAGENTO STOCK CHECKER (ASYNC) ==================
 class AsyncMagentoStockChecker:
@@ -272,14 +281,70 @@ class AsyncMagentoStockChecker:
         finally:
             self.stats["processed"] += 1
 
-    async def process_all(self, products: List[Dict]) -> List[int]:
+    async def process_all_incremental(self, products: List[Dict], sheets: "GoogleSheetsUpdater", date_header: str, header_row: int, chunk_size: int, incremental: bool, flush_every: int, flush_seconds: int) -> List[int]:
+        """
+        Processa todos os produtos com escrita incremental opcional.
+        """
         self.stats["start_time"] = time.time()
-        sem = asyncio.Semaphore(self._max_workers)  # criado dentro do loop
+        sem = asyncio.Semaphore(self._max_workers)
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=60)
-        connector = aiohttp.TCPConnector(limit=0)  # sem limite além do semáforo
+        connector = aiohttp.TCPConnector(limit=0)
+
+        # Garante a coluna já criada e pega a letra
+        col, _created = sheets.ensure_date_column(date_header, header_row)
+        start_row_base = header_row + 1
+
+        stocks: List[Optional[int]] = [None] * len(products)
+        done_idx = set()
+        last_flush_time = time.time()
+        last_flushed_index = -1  # maior índice contíguo já escrito
+
         async with aiohttp.ClientSession(headers=self.headers, timeout=timeout, connector=connector) as session:
-            tasks = [self.check_stock(session, sem, p["sku"]) for p in products]
-            return await asyncio.gather(*tasks, return_exceptions=False)
+            # cria tasks indexadas
+            async def runner(idx: int, sku: str):
+                val = await self.check_stock(session, sem, sku)
+                stocks[idx] = val
+                done_idx.add(idx)
+
+            tasks = [asyncio.create_task(runner(i, p["sku"])) for i, p in enumerate(products)]
+
+            async def contiguous_prefix_max() -> int:
+                """
+                Retorna o maior índice k tal que todos 0..k estão concluídos.
+                """
+                k = last_flushed_index
+                while (k + 1) < len(stocks) and ((k + 1) in done_idx):
+                    k += 1
+                return k
+
+            async def maybe_flush(force: bool = False):
+                nonlocal last_flush_time, last_flushed_index
+                if not incremental and not force:
+                    return
+                time_ok = (time.time() - last_flush_time) >= flush_seconds
+                count_ok = (len(done_idx) - (last_flushed_index + 1)) >= flush_every
+                if force or time_ok or count_ok:
+                    k = await contiguous_prefix_max()
+                    if k > last_flushed_index:
+                        # escreve do próximo após o último flush até k
+                        start_row = start_row_base + (last_flushed_index + 1)
+                        block = stocks[(last_flushed_index + 1):(k + 1)]
+                        sheets.update_column_range_chunked(col, header_row, start_row, block, chunk_size)
+                        last_flushed_index = k
+                        last_flush_time = time.time()
+                        logger.info(f"📝 Flush incremental: linhas {start_row}..{start_row + len(block) - 1} (prefixo contíguo {k+1}/{len(stocks)})")
+
+            # consume completions e faz flushes periódicos
+            for coro in asyncio.as_completed(tasks):
+                await coro
+                # flush por contagem/tempo
+                await maybe_flush(force=False)
+
+            # flush final (qualquer restante)
+            await maybe_flush(force=True)
+
+        # Preenche None com "" para escrita final
+        return [ (x if x is not None else "") for x in stocks ]
 
 # ================== MAIN ==================
 def main():
@@ -294,11 +359,17 @@ def main():
     max_workers = int(os.getenv("MAX_WORKERS", "20"))
     max_stock = int(os.getenv("MAX_STOCK", "5000"))
 
+    incremental = os.getenv("INCREMENTAL_WRITE", "false").lower() == "true"
+    flush_every = int(os.getenv("FLUSH_EVERY", "500"))
+    flush_seconds = int(os.getenv("FLUSH_SECONDS", "120"))
+    chunk_size = int(os.getenv("CHUNK_SIZE", "1000"))
+
     logger.info("🚀 Iniciando Sistema de Verificação de Estoque Magento")
     logger.info(f"SPREADSHEET_ID: {mask(spreadsheet_id)}")
     logger.info(f"MAGENTO_BASE_URL: {magento_base_url}")
     logger.info(f"TEST_MODE: {test_mode} | BATCH_SIZE: {batch_size}")
     logger.info(f"⚡ Max workers: {max_workers} | ⏱️ Rate limit: {rate_limit}s | 📈 MAX_STOCK: {max_stock}")
+    logger.info(f"🧾 Incremental: {incremental} | FLUSH_EVERY={flush_every} | FLUSH_SECONDS={flush_seconds} | CHUNK_SIZE={chunk_size}")
 
     sheets = GoogleSheetsUpdater(spreadsheet_id, creds_path)
     products = sheets.read_products()
@@ -314,11 +385,22 @@ def main():
         magento_base_url, magento_api_key,
         rate_limit=rate_limit, max_stock=max_stock, max_workers=max_workers
     )
-    stocks = asyncio.run(checker.process_all(products))
 
-    # Escreve no Google Sheets (coluna com a data de hoje em UTC), com retries + chunking
     date_header = datetime.utcnow().strftime("%Y-%m-%d")
-    sheets.write_timeseries_column(stocks, date_header)
+    # Processa com incremental e retorna todos os estoques (com gaps preenchidos como "")
+    stocks = asyncio.run(
+        checker.process_all_incremental(
+            products, sheets, date_header,
+            header_row=1,
+            chunk_size=chunk_size,
+            incremental=incremental,
+            flush_every=flush_every,
+            flush_seconds=flush_seconds
+        )
+    )
+
+    # Escrita final (garante que tudo ficou persistido; reusa a mesma coluna)
+    sheets.write_timeseries_column_all(stocks, date_header, header_row=1, chunk_size=chunk_size)
 
     elapsed = time.time() - checker.stats["start_time"]
     speed = checker.stats["processed"] / elapsed if elapsed > 0 else 0
