@@ -1,4 +1,4 @@
-name: Stock Check (Daily + Manual)
+name: 🤖 Daily Stock Check - Sistema Magento (Daily + Manual)
 
 on:
   schedule:
