@@ -50,8 +50,8 @@ jobs:
 
     env:
       # Vars fixas do repositório (Settings > Variables)
-      SPREADSHEET_ID: ${{ vars.SPREADSHEET_ID }}
-      MAGENTO_BASE_URL: ${{ vars.MAGENTO_BASE_URL }}
+      SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+      MAGENTO_BASE_URL: ${{ secrets.MAGENTO_BASE_URL }}
       MAX_STOCK: ${{ vars.MAX_STOCK || '5000' }}
       GOOGLE_APPLICATION_CREDENTIALS: /tmp/google-credentials.json
 
