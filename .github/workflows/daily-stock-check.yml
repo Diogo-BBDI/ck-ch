@@ -1,4 +1,7 @@
-name: 🤖 Daily Stock Check - Sistema Magento (Daily + Manual)
+# .github/workflows/daily-stock-check.yml
+# Workflow para execução automática diária do sistema de verificação de estoque
+
+name: 🤖 Daily Stock Check - Sistema Magento
 
 on:
   schedule:
@@ -7,37 +10,37 @@ on:
   workflow_dispatch:
     inputs:
       test_mode:
-        description: "TEST_MODE (manual)"
+        description: 'Modo de teste (processa apenas N itens)'
         type: choice
-        options: [true, false]
-        default: true
+        options: [false, true]
+        default: false
       batch_size:
-        description: "BATCH_SIZE (manual)"
+        description: 'Quantidade a processar quando test_mode=true'
         type: number
         default: 50
       incremental_write:
-        description: "INCREMENTAL_WRITE (manual)"
+        description: 'Escrita incremental na planilha'
         type: choice
         options: [true, false]
         default: true
       flush_every:
-        description: "FLUSH_EVERY (manual)"
+        description: 'Flush a cada N itens concluídos'
         type: number
         default: 500
       flush_seconds:
-        description: "FLUSH_SECONDS (manual)"
+        description: 'Flush a cada N segundos'
         type: number
         default: 120
       chunk_size:
-        description: "CHUNK_SIZE (manual)"
+        description: 'Tamanho do bloco ao escrever no Sheets'
         type: number
         default: 1000
       rate_limit:
-        description: "RATE_LIMIT (manual)"
+        description: 'Intervalo entre tentativas do algoritmo (seg)'
         type: string
         default: "0.1"
       max_workers:
-        description: "MAX_WORKERS (manual)"
+        description: 'Concorrência (tarefas simultâneas)'
         type: number
         default: 20
 
@@ -45,17 +48,22 @@ permissions:
   contents: read
 
 jobs:
-  run:
+  stock-check:
+    name: 📊 Verificação de Estoque
     runs-on: ubuntu-latest
+    timeout-minutes: 300  # até 5h
 
     env:
-      # Vars fixas do repositório (Settings > Variables)
-      SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-      MAGENTO_BASE_URL: ${{ secrets.MAGENTO_BASE_URL }}
-      MAX_STOCK: ${{ vars.MAX_STOCK || '5000' }}
+      # Caminho do arquivo de credenciais Google que vamos escrever
       GOOGLE_APPLICATION_CREDENTIALS: /tmp/google-credentials.json
 
-      # Agendado = produção; Manual = usa inputs
+      # SENSÍVEIS → SEMPRE via SECRETS
+      SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+      MAGENTO_BASE_URL: ${{ secrets.MAGENTO_BASE_URL }}
+      # MAX_STOCK não é sensível; se quiser também pode ir em vars
+      MAX_STOCK: ${{ vars.MAX_STOCK || '5000' }}
+
+      # Defaults para execução agendada; se for manual, usa inputs
       TEST_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.test_mode || 'false' }}
       BATCH_SIZE: ${{ github.event_name == 'workflow_dispatch' && inputs.batch_size || '50' }}
 
@@ -70,29 +78,34 @@ jobs:
       CHUNK_SIZE: ${{ github.event_name == 'workflow_dispatch' && inputs.chunk_size || '1000' }}
 
     steps:
-      - name: Checkout
+      - name: 📥 Checkout código
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: 🐍 Configurar Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.9'
+          cache: 'pip'
 
-      - name: Write Google credentials (from secret base64)
-        shell: bash
-        run: |
-          echo "$GOOGLE_CREDENTIALS_B64" | base64 -d > "$GOOGLE_APPLICATION_CREDENTIALS"
-          ls -l "$GOOGLE_APPLICATION_CREDENTIALS"
+      - name: 🔐 Configurar credenciais Google
         env:
-          GOOGLE_CREDENTIALS_B64: ${{ secrets.GOOGLE_CREDENTIALS_B64 }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}  # JSON puro
+        run: |
+          echo "$GOOGLE_CREDENTIALS" > "$GOOGLE_APPLICATION_CREDENTIALS"
+          ls -l "$GOOGLE_APPLICATION_CREDENTIALS"
 
-      - name: Install dependencies
+      - name: ✅ Preflight env check
+        run: |
+          test -n "$SPREADSHEET_ID" || { echo "SPREADSHEET_ID não definido (secrets)"; exit 1; }
+          test -n "$MAGENTO_BASE_URL" || { echo "MAGENTO_BASE_URL não definido (secrets)"; exit 1; }
+          test -n "$GOOGLE_APPLICATION_CREDENTIALS" || { echo "GOOGLE_APPLICATION_CREDENTIALS ausente"; exit 1; }
+
+      - name: 📦 Instalar dependências
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run stock check
-        shell: bash
+      - name: 🚀 Executar verificação de estoque
         env:
           MAGENTO_API_KEY: ${{ secrets.MAGENTO_API_KEY }}
         run: |
@@ -104,11 +117,12 @@ jobs:
             exit 1
           fi
 
-      - name: Upload logs (artifact)
+      - name: 📁 Upload logs de execução
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs
+          name: stock-check-logs-${{ github.run_number }}
           path: |
             *.log
           if-no-files-found: ignore
+          retention-days: 30
