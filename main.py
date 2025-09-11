@@ -2,19 +2,20 @@
 """
 Sistema de Verificação de Estoque Magento/Adobe Commerce
 Versão adaptada para GitHub Actions (cron)
-- Lê SKUs de uma planilha Google
+- Lê SKUs de uma planilha Google (aba EstoqueProdutos)
 - Usa algoritmo otimizado para estimar estoque via carrinho convidado
-- Escreve resultados de volta na planilha
+- Escreve resultados de volta na planilha, após a última coluna existente
 
-Requer variáveis de ambiente:
+Variáveis de ambiente exigidas:
 - GOOGLE_APPLICATION_CREDENTIALS: caminho do JSON da service account (ex.: /tmp/google-credentials.json)
-- SPREADSHEET_ID: ID da planilha Google
-- MAGENTO_API_KEY: Chave da API (X-Api-Key)
-- MAGENTO_BASE_URL: Base da loja (ex.: https://www.bringit.com.br)
-- TEST_MODE: "true"/"false" (se true limita processamento)
+- SPREADSHEET_ID: ID da planilha
+- MAGENTO_API_KEY: chave da API (X-Api-Key)
+- MAGENTO_BASE_URL: base da loja (ex.: https://www.bringit.com.br)
+Opcional:
+- TEST_MODE: "true"/"false" (se true, limita processamento)
 - BATCH_SIZE: inteiro (quantos SKUs processar no teste)
-- RATE_LIMIT: segundos entre requests críticos (default 0.3)
-- MAX_WORKERS: threads simultâneas (default 6)
+- RATE_LIMIT: segundos (default 0.3)
+- MAX_WORKERS: inteiro (default 6)
 """
 
 import os
@@ -29,7 +30,7 @@ from threading import Lock
 from typing import List, Dict, Optional, Tuple
 
 import requests
-import pandas as pd
+import pandas as pd  # mantido por compatibilidade; ok se não for usado diretamente
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
@@ -57,114 +58,154 @@ def mask(value: Optional[str], keep: int = 4) -> str:
     v = str(value)
     return v if len(v) <= keep else (v[:keep] + "...")
 
+def mask_email(email: str) -> str:
+    try:
+        user, dom = email.split("@", 1)
+        return (user[:3] + "***@" + dom) if len(user) > 3 else ("***@" + dom)
+    except Exception:
+        return mask(email)
+
 def now_ts_iso() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def col_letter(n: int) -> str:
+    """1->A, 2->B, ..., 27->AA"""
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
 
 # ================== GOOGLE SHEETS ==================
 class GoogleSheetsUpdater:
     """
     Leitura e escrita no Google Sheets via Service Account.
-    Estrutura esperada (padrão, ajustável via parâmetros):
-      - Guia de entrada: "Produtos" com colunas: sku, hint (opcional)
-      - Escrita de saída: Colunas anexadas na mesma guia (ou em outra).
+
+    Guia esperada: "EstoqueProdutos"
+      - Primeira linha = cabeçalho com colunas como: Família | SKU | Título | 2025-09-11 | ...
+      - Lemos apenas a coluna "SKU" (case-insensitive).
+      - Escrevemos colunas novas após a última coluna do cabeçalho:
+        status | stock | checked_at | notes
     """
-    def __init__(self, spreadsheet_id: str, creds_path: str, input_sheet: str = "Produtos", output_sheet: Optional[str] = None):
+    def __init__(self, spreadsheet_id: str, creds_path: str, input_sheet: str = "EstoqueProdutos", output_sheet: Optional[str] = None):
         self.spreadsheet_id = spreadsheet_id
         self.creds_path = creds_path
         self.input_sheet = input_sheet
-        # Se não definir output_sheet, escreve na mesma guia (append colunas)
         self.output_sheet = output_sheet or input_sheet
 
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = service_account.Credentials.from_service_account_file(self.creds_path, scopes=scopes)
+        self.sa_email = ""
+        try:
+            with open(self.creds_path, "r") as fh:
+                self.sa_email = json.load(fh).get("client_email", "")
+        except Exception:
+            pass
         self.service = build("sheets", "v4", credentials=creds, cache_discovery=False)
 
-    def read_products(self, header_row: int = 1, range_start_col: str = "A", range_end_col: str = "B") -> List[Dict]:
+    def read_products(self, header_row: int = 1) -> List[Dict]:
         """
-        Lê produtos do intervalo: <input_sheet>!A:B
-        Espera cabeçalho na primeira linha: sku | hint (opcional)
+        Lê produtos da aba definida (EstoqueProdutos), detectando a coluna 'SKU' na primeira linha.
+        Retorna lista de dicts: {"sku": <str>, "hint": 1}
         """
-        range_name = f"{self.input_sheet}!{range_start_col}:{range_end_col}"
-        resp = self.service.spreadsheets().values().get(
-            spreadsheetId=self.spreadsheet_id,
-            range=range_name,
-            valueRenderOption="UNFORMATTED_VALUE",
-            dateTimeRenderOption="FORMATTED_STRING",
-        ).execute()
+        range_name = f"{self.input_sheet}!A:ZZ"
+        try:
+            resp = self.service.spreadsheets().values().get(
+                spreadsheetId=self.spreadsheet_id,
+                range=range_name,
+                valueRenderOption="UNFORMATTED_VALUE",
+                dateTimeRenderOption="FORMATTED_STRING",
+            ).execute()
+        except Exception:
+            logger.exception("Erro ao acessar a planilha (talvez permissão faltando?)")
+            if self.sa_email:
+                logger.error(f"Compartilhe a planilha com a Service Account: {mask_email(self.sa_email)}")
+            raise
 
         values = resp.get("values", [])
         if not values or len(values) <= (header_row - 1):
             logger.warning("Nenhum dado encontrado na planilha de entrada.")
             return []
 
-        headers = [h.strip().lower() for h in values[header_row - 1]]
+        headers_raw = values[header_row - 1]
+        headers = [str(h).strip() for h in headers_raw]
+        headers_lower = [h.lower() for h in headers]
+
+        # Localiza coluna SKU
+        try:
+            sku_idx = headers_lower.index("sku")
+        except ValueError:
+            raise RuntimeError("Cabeçalho 'SKU' não encontrado na primeira linha da guia.")
+
         data_rows = values[header_row:]
-        products = []
+        products: List[Dict] = []
         for row in data_rows:
             row_extended = row + [""] * max(0, len(headers) - len(row))
-            row_dict = dict(zip(headers, row_extended))
-            sku = str(row_dict.get("sku", "")).strip()
+            sku = str(row_extended[sku_idx]).strip() if len(row_extended) > sku_idx else ""
             if not sku:
                 continue
-            hint_val = row_dict.get("hint", "")
-            try:
-                hint = int(hint_val) if str(hint_val).strip() != "" else 1
-            except Exception:
-                hint = 1
-            products.append({"sku": sku, "hint": hint})
+            products.append({"sku": sku, "hint": 1})
 
         logger.info(f"🧾 Produtos lidos: {len(products)}")
         return products
 
-    def write_results_adjacent(self, results: List[Dict], header_row: int = 1, start_col: str = "D") -> None:
+    def write_results_adjacent(self, results: List[Dict], header_row: int = 1) -> None:
         """
-        Escreve resultados em colunas adjacentes na mesma guia (output_sheet).
-        Layout gerado a partir da coluna 'start_col':
-          start_col     : status
-          next          : stock
-          next          : checked_at
-          next          : notes
+        Escreve resultados em colunas novas logo APÓS a última coluna do cabeçalho (linha 1).
+        Layout adicionado: status | stock | checked_at | notes
+        As linhas de saída começam na linha 2 e seguem na mesma ordem dos produtos lidos.
         """
         if not results:
             logger.info("Sem resultados para escrever.")
             return
 
-        headers = ["status", "stock", "checked_at", "notes"]
-        start_col_letter = start_col.upper()
-        col_index = ord(start_col_letter) - ord("A") + 1  # 1-based
+        # 1) Descobre última coluna do cabeçalho
+        header_resp = self.service.spreadsheets().values().get(
+            spreadsheetId=self.spreadsheet_id,
+            range=f"{self.output_sheet}!{header_row}:{header_row}",
+            valueRenderOption="UNFORMATTED_VALUE",
+            dateTimeRenderOption="FORMATTED_STRING",
+        ).execute()
+        header_values = header_resp.get("values", [[]])
+        existing_headers = header_values[0] if header_values else []
+        last_col_index = len(existing_headers)  # 1-based start será +1
 
-        # monta valores para escrita
-        write_values = [headers]
-        for r in results:
-            row = [
-                r.get("status", ""),
-                r.get("stock", ""),
-                r.get("checked_at", ""),
-                r.get("notes", "")
-            ]
-            write_values.append(row)
+        # 2) Prepara novos cabeçalhos
+        new_headers = ["status", "stock", "checked_at", "notes"]
+        start_idx = last_col_index + 1
+        end_idx = start_idx + len(new_headers) - 1
+        start_col_letter = col_letter(start_idx)
+        end_col_letter = col_letter(end_idx)
 
-        # Determina o range de escrita
-        end_col_index = col_index + len(headers) - 1
-        end_col_letter = chr(ord("A") + end_col_index - 1)
-        start_range = f"{self.output_sheet}!{start_col_letter}{header_row}:{end_col_letter}"
-        # Escreve cabeçalho na linha 1 (ou header_row)
+        # 3) Escreve cabeçalhos
         self.service.spreadsheets().values().update(
             spreadsheetId=self.spreadsheet_id,
             range=f"{self.output_sheet}!{start_col_letter}{header_row}:{end_col_letter}{header_row}",
             valueInputOption="RAW",
-            body={"values": [headers]},
+            body={"values": [new_headers]},
         ).execute()
 
-        # Escreve linhas (a partir da 2)
+        # 4) Monta linhas (uma por resultado)
+        write_values = []
+        for r in results:
+            write_values.append([
+                r.get("status", ""),
+                r.get("stock", ""),
+                r.get("checked_at", ""),
+                r.get("notes", "")
+            ])
+
+        # 5) Escreve as linhas (a partir da 2)
+        start_row = header_row + 1
+        end_row = header_row + len(write_values)
         self.service.spreadsheets().values().update(
             spreadsheetId=self.spreadsheet_id,
-            range=f"{self.output_sheet}!{start_col_letter}{header_row+1}:{end_col_letter}",
+            range=f"{self.output_sheet}!{start_col_letter}{start_row}:{end_col_letter}{end_row}",
             valueInputOption="RAW",
-            body={"values": write_values[1:]},
+            body={"values": write_values},
         ).execute()
 
-        logger.info(f"📝 Resultados escritos em {self.output_sheet}!{start_col_letter}:{end_col_letter}")
+        logger.info(f"📝 Resultados escritos em {self.output_sheet}!{start_col_letter}{start_row}:{end_col_letter}{end_row}")
 
 # ================== MAGENTO STOCK CHECKER ==================
 class MagentoStockChecker:
@@ -266,7 +307,7 @@ class MagentoStockChecker:
 
     def delete_item(self, cart_id: str, item_id: str):
         try:
-            response = self.session.delete(
+            self.session.delete(
                 f"{self.base_url}/rest/V1/guest-carts/{cart_id}/items/{item_id}",
                 timeout=30
             )
@@ -330,7 +371,7 @@ class MagentoStockChecker:
     def process_batch(self, products: List[Dict]) -> List[Dict]:
         """
         Processa lote de produtos em paralelo.
-        Espera itens com chaves: sku, hint (opcional).
+        Espera itens com chave: sku (e hint opcional).
         """
         results: List[Dict] = []
         self.stats["total_products"] = len(products)
@@ -363,21 +404,21 @@ class MagentoStockChecker:
                     "notes": str(e)
                 }
 
-        # thread pool
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = [executor.submit(process_single, p) for p in products]
             for i, fut in enumerate(concurrent.futures.as_completed(futures), 1):
                 res = fut.result()
                 results.append(res)
 
-                # métricas periódicas
                 if i % 20 == 0 or i == len(products):
                     elapsed = time.time() - self.stats["start_time"]
                     rate = (self.stats["processed"] / elapsed) if elapsed > 0 else 0
-                    logger.info(f"📦 Processados {self.stats['processed']}/{self.stats['total_products']} | "
-                                f"Erros: {self.stats['errors']} | "
-                                f"Reqs: {self.stats['requests_made']} | "
-                                f"Velocidade: {rate:.2f} it/s")
+                    logger.info(
+                        f"📦 Processados {self.stats['processed']}/{self.stats['total_products']} | "
+                        f"Erros: {self.stats['errors']} | "
+                        f"Reqs: {self.stats['requests_made']} | "
+                        f"Velocidade: {rate:.2f} it/s"
+                    )
 
         return results
 
@@ -404,16 +445,19 @@ def main():
     sheets = GoogleSheetsUpdater(
         spreadsheet_id=spreadsheet_id,
         creds_path=google_credentials_path,
-        input_sheet="Produtos",           # ajuste se necessário
-        output_sheet="Produtos"           # ou "Resultados" se preferir outra guia
+        input_sheet="EstoqueProdutos",
+        output_sheet="EstoqueProdutos"
     )
+    if getattr(sheets, "sa_email", ""):
+        logger.info(f"Service Account: {mask_email(sheets.sa_email)}")
+
     checker = MagentoStockChecker(
         base_url=magento_base_url,
         api_key=magento_api_key
     )
 
-    # Lê produtos
-    products = sheets.read_products(input_sheet_range_hint())
+    # Lê produtos (ordem preservada)
+    products = sheets.read_products()
     if not products:
         logger.error("❌ Nenhum produto encontrado na planilha. Encerrando.")
         sys.exit(1)
@@ -423,13 +467,13 @@ def main():
         products = products[:batch_size]
         logger.info(f"🧪 TEST_MODE ativo: processando {len(products)} produtos")
 
-    # Embaralha levemente para evitar burst em SKUs consecutivos idênticos
+    # Embaralha levemente para evitar burst em SKUs sequenciais
     random.shuffle(products)
 
     # Processa
     results = checker.process_batch(products)
 
-    # Ordena resultados para alinhar com a ordem lida (opcional)
+    # Realinha resultados na mesma ordem da leitura (garantia)
     sku_to_result = {r["sku"]: r for r in results}
     aligned_results = []
     for p in products:
@@ -437,8 +481,8 @@ def main():
             "sku": p["sku"], "status": "MISSING", "stock": "", "checked_at": now_ts_iso(), "notes": "sem retorno"
         }))
 
-    # Escreve na planilha (a partir da coluna D, ajustável)
-    sheets.write_results_adjacent(aligned_results, header_row=1, start_col="D")
+    # Escreve na planilha após a última coluna existente
+    sheets.write_results_adjacent(aligned_results, header_row=1)
 
     # Resumo
     elapsed = time.time() - checker.stats["start_time"]
@@ -448,17 +492,9 @@ def main():
     logger.info(f"⏱️ Tempo total: {elapsed:.1f}s | Requisições: {checker.stats['requests_made']}")
     logger.info("============================================================")
 
-def input_sheet_range_hint() -> tuple:
-    """
-    Apenas um helper sem efeito no Sheets API: mantive para clareza de leitura acima.
-    O método read_products define internamente A:B como padrão.
-    Essa função existe só para compatibilidade com a chamada 'sheets.read_products(input_sheet_range_hint())'
-    """
-    return ("A", "B")
-
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
+    except Exception:
         logger.exception("Falha na execução principal")
         sys.exit(1)
