@@ -1,132 +1,114 @@
-# .github/workflows/daily-stock-check.yml
-# Workflow para execução automática diária do sistema de verificação de estoque
-
-name: 🤖 Daily Stock Check - Sistema Magento
+name: Stock Check (Daily + Manual)
 
 on:
   schedule:
-  - cron: '0 7 * * *'  # Executa todo dia às 09:00 UTC (06:00 BRT)
+    # 04:00 BRT = 07:00 UTC
+    - cron: '0 7 * * *'
   workflow_dispatch:
     inputs:
       test_mode:
-        description: 'Modo de teste (apenas poucos produtos)'
-        required: false
-        default: 'false'
+        description: "TEST_MODE (manual)"
         type: choice
-        options:
-          - 'true'
-          - 'false'
+        options: [true, false]
+        default: true
       batch_size:
-        description: 'Tamanho do batch'
-        required: false
-        default: '50'
+        description: "BATCH_SIZE (manual)"
+        type: number
+        default: 50
+      incremental_write:
+        description: "INCREMENTAL_WRITE (manual)"
+        type: choice
+        options: [true, false]
+        default: true
+      flush_every:
+        description: "FLUSH_EVERY (manual)"
+        type: number
+        default: 500
+      flush_seconds:
+        description: "FLUSH_SECONDS (manual)"
+        type: number
+        default: 120
+      chunk_size:
+        description: "CHUNK_SIZE (manual)"
+        type: number
+        default: 1000
+      rate_limit:
+        description: "RATE_LIMIT (manual)"
+        type: string
+        default: "0.1"
+      max_workers:
+        description: "MAX_WORKERS (manual)"
+        type: number
+        default: 20
+
+permissions:
+  contents: read
 
 jobs:
-  stock-check:
-    name: 📊 Verificação de Estoque
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 300  # 5 horas max
+
+    env:
+      # Vars fixas do repositório (Settings > Variables)
+      SPREADSHEET_ID: ${{ vars.SPREADSHEET_ID }}
+      MAGENTO_BASE_URL: ${{ vars.MAGENTO_BASE_URL }}
+      MAX_STOCK: ${{ vars.MAX_STOCK || '5000' }}
+      GOOGLE_APPLICATION_CREDENTIALS: /tmp/google-credentials.json
+
+      # Agendado = produção; Manual = usa inputs
+      TEST_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.test_mode || 'false' }}
+      BATCH_SIZE: ${{ github.event_name == 'workflow_dispatch' && inputs.batch_size || '50' }}
+
+      # Performance / concorrência
+      RATE_LIMIT: ${{ github.event_name == 'workflow_dispatch' && inputs.rate_limit || '0.1' }}
+      MAX_WORKERS: ${{ github.event_name == 'workflow_dispatch' && inputs.max_workers || '20' }}
+
+      # Escrita incremental no Sheets
+      INCREMENTAL_WRITE: ${{ github.event_name == 'workflow_dispatch' && inputs.incremental_write || 'true' }}
+      FLUSH_EVERY: ${{ github.event_name == 'workflow_dispatch' && inputs.flush_every || '500' }}
+      FLUSH_SECONDS: ${{ github.event_name == 'workflow_dispatch' && inputs.flush_seconds || '120' }}
+      CHUNK_SIZE: ${{ github.event_name == 'workflow_dispatch' && inputs.chunk_size || '1000' }}
 
     steps:
-    - name: 📥 Checkout código
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: 🐍 Configurar Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.9'
-        cache: 'pip'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
 
-    - name: 📦 Instalar dependências
-      run: |
-        pip install --upgrade pip
-        pip cache purge
-        pip install -r requirements.txt --verbose
+      - name: Write Google credentials (from secret base64)
+        shell: bash
+        run: |
+          echo "$GOOGLE_CREDENTIALS_B64" | base64 -d > "$GOOGLE_APPLICATION_CREDENTIALS"
+          ls -l "$GOOGLE_APPLICATION_CREDENTIALS"
+        env:
+          GOOGLE_CREDENTIALS_B64: ${{ secrets.GOOGLE_CREDENTIALS_B64 }}
 
-    - name: 🔐 Configurar credenciais Google
-      env:
-        GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-      run: |
-        echo "$GOOGLE_CREDENTIALS" > /tmp/google-credentials.json
-        export GOOGLE_APPLICATION_CREDENTIALS=/tmp/google-credentials.json
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    - name: 📊 Executar verificação de estoque
-      env:
-        GOOGLE_APPLICATION_CREDENTIALS: /tmp/google-credentials.json
-        SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
-        MAGENTO_API_KEY: ${{ secrets.MAGENTO_API_KEY }}
-        MAGENTO_BASE_URL: ${{ secrets.MAGENTO_BASE_URL }}
-        TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
-        BATCH_SIZE: ${{ github.event.inputs.batch_size || '50' }}
-      run: |
-        echo "🚀 Iniciando verificação de estoque..."
-        python main.py || { echo "❌ Script falhou"; cat *.log; exit 1; }
+      - name: Run stock check
+        shell: bash
+        env:
+          MAGENTO_API_KEY: ${{ secrets.MAGENTO_API_KEY }}
+        run: |
+          echo "🚀 Iniciando verificação de estoque..."
+          if ! python main.py; then
+            echo "❌ Script falhou"
+            ls -1 *.log 2>/dev/null || true
+            cat *.log 2>/dev/null || true
+            exit 1
+          fi
 
-    - name: 📁 Upload logs de execução
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: stock-check-logs-${{ github.run_number }}
-        path: |
-          *.csv
-          *.log
-        retention-days: 30
-
-    - name: 📧 Notificar resultado (sucesso)
-      if: success()
-      run: |
-        echo "✅ Verificação de estoque concluída com sucesso!"
-
-    - name: 📧 Notificar resultado (falha)
-      if: failure()
-      run: |
-        echo "❌ Verificação de estoque falhou!"
-
-  weekly-report:
-    name: 📈 Relatório Semanal
-    runs-on: ubuntu-latest
-    if: github.event.schedule == '0 9 * * 1'  # Apenas nas segundas-feiras
-    needs: stock-check
-
-    steps:
-    - name: 📥 Checkout código
-      uses: actions/checkout@v4
-
-    - name: 🐍 Configurar Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.9'
-
-    - name: 📊 Gerar relatório semanal
-      run: |
-        echo "📈 Gerando relatório semanal..."
-        echo "✅ Relatório gerado!"
-
-# Configuração de notificações por email (opcional)
-# Adicione esta seção se quiser receber emails sobre execuções
-# notify:
-#    name: 📧 Notificações
-#    runs-on: ubuntu-latest
-#    needs: stock-check
-#    if: always()
-#    
-#    steps:
-#    - name: 📧 Enviar email de notificação
-#      if: always()
-#      uses: dawidd6/action-send-mail@v3
-#      with:
-#        server_address: smtp.gmail.com
-#        server_port: 587
-#        username: ${{ secrets.EMAIL_USERNAME }}
-#        password: ${{ secrets.EMAIL_PASSWORD }}
-#        subject: |
-#          ${{ job.status == 'success' && '✅' || '❌' }} Stock Check - ${{ github.run_number }}
-#        body: |
-#          Status: ${{ job.status }}
-#          Workflow: ${{ github.workflow }}
-#          Run: ${{ github.run_number }}
-#          Timestamp: ${{ github.event.head_commit.timestamp }}
-          
-#          ${{ job.status == 'success' && 'Verificação de estoque executada com sucesso!' || 'Falha na verificação de estoque. Verifique os logs.' }}
-#        to: seu-email@exemplo.com
-#        from: Sistema de Estoque <noreply@exemplo.com>
+      - name: Upload logs (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: |
+            *.log
+          if-no-files-found: ignore
