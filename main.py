@@ -6,6 +6,7 @@ Sistema de Verificação de Estoque Magento/Adobe Commerce
 - Timeouts configuráveis (SOCK_CONNECT_TIMEOUT, SOCK_READ_TIMEOUT)
 - Escrita incremental opcional no Google Sheets (INCREMENTAL_WRITE=true)
 - Escrita final em chunks (CHUNK_SIZE, default 1000)
+- Auto-expansão de colunas quando necessário
 
 ENV no GitHub Actions:
 - GOOGLE_APPLICATION_CREDENTIALS: caminho do JSON da service account
@@ -23,6 +24,8 @@ ENV no GitHub Actions:
 - CHUNK_SIZE: int (default 1000)
 - SOCK_CONNECT_TIMEOUT: seg (default 30)
 - SOCK_READ_TIMEOUT: seg (default 180)
+- AUTO_EXPAND_COLUMNS: "true"/"false" (default true)
+- EXPAND_BUFFER: número de colunas extras a adicionar (default 5)
 """
 
 import os
@@ -100,9 +103,11 @@ def _mg_retry():
 
 # ================== GOOGLE SHEETS ==================
 class GoogleSheetsUpdater:
-    def __init__(self, spreadsheet_id: str, creds_path: str, input_sheet: str = "EstoqueProdutos"):
+    def __init__(self, spreadsheet_id: str, creds_path: str, input_sheet: str = "EstoqueProdutos", auto_expand: bool = True, expand_buffer: int = 5):
         self.spreadsheet_id = spreadsheet_id
         self.input_sheet = input_sheet
+        self.auto_expand = auto_expand
+        self.expand_buffer = expand_buffer
 
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = service_account.Credentials.from_service_account_file(creds_path, scopes=scopes)
@@ -126,6 +131,59 @@ class GoogleSheetsUpdater:
             body={"values": values},
         ).execute(num_retries=3)
 
+    @_gs_retry()
+    def _get_sheet_properties(self) -> Dict:
+        """Obtém as propriedades da planilha incluindo dimensões."""
+        response = self.service.spreadsheets().get(spreadsheetId=self.spreadsheet_id).execute()
+        for sheet in response.get('sheets', []):
+            if sheet['properties']['title'] == self.input_sheet:
+                return sheet['properties']
+        raise RuntimeError(f"Sheet '{self.input_sheet}' não encontrada")
+
+    @_gs_retry()
+    def _expand_sheet_columns(self, new_column_count: int) -> None:
+        """Expande a planilha para ter pelo menos new_column_count colunas."""
+        sheet_props = self._get_sheet_properties()
+        sheet_id = sheet_props['sheetId']
+        current_cols = sheet_props.get('gridProperties', {}).get('columnCount', 26)
+        
+        if new_column_count > current_cols:
+            request = {
+                "requests": [{
+                    "updateSheetProperties": {
+                        "properties": {
+                            "sheetId": sheet_id,
+                            "gridProperties": {
+                                "columnCount": new_column_count
+                            }
+                        },
+                        "fields": "gridProperties.columnCount"
+                    }
+                }]
+            }
+            
+            self.service.spreadsheets().batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body=request
+            ).execute()
+            
+            logger.info(f"🔧 Planilha expandida de {current_cols} para {new_column_count} colunas")
+
+    def _ensure_column_exists(self, col_index: int) -> None:
+        """Garante que a coluna especificada existe na planilha."""
+        if not self.auto_expand:
+            return
+            
+        try:
+            sheet_props = self._get_sheet_properties()
+            current_cols = sheet_props.get('gridProperties', {}).get('columnCount', 26)
+            
+            if col_index > current_cols:
+                new_col_count = col_index + self.expand_buffer
+                self._expand_sheet_columns(new_col_count)
+        except Exception as e:
+            logger.warning(f"Não foi possível verificar/expandir colunas: {e}")
+
     def read_products(self, header_row: int = 1) -> List[Dict]:
         resp = self._values_get(f"{self.input_sheet}!A:ZZ")
         values = resp.get("values", [])
@@ -146,6 +204,7 @@ class GoogleSheetsUpdater:
         return products
 
     def ensure_date_column(self, date_header: str, header_row: int = 1) -> Tuple[str, bool]:
+        """Garante que a coluna de data existe, expandindo a planilha se necessário."""
         header_resp = self._values_get(f"{self.input_sheet}!{header_row}:{header_row}")
         existing_headers = header_resp.get("values", [[]])
         existing_headers = [str(h).strip() for h in (existing_headers[0] if existing_headers else [])]
@@ -157,9 +216,26 @@ class GoogleSheetsUpdater:
             col_index = len(existing_headers) + 1
             created = True
 
+        # Garante que a coluna existe antes de tentar escrever
+        self._ensure_column_exists(col_index)
+        
         col = col_letter(col_index)
         if created:
-            self._values_update(f"{self.input_sheet}!{col}{header_row}", [[date_header]])
+            try:
+                self._values_update(f"{self.input_sheet}!{col}{header_row}", [[date_header]])
+                logger.info(f"📅 Nova coluna criada: {col} ('{date_header}')")
+            except HttpError as e:
+                if "exceeds grid limits" in str(e):
+                    logger.warning(f"Limite de colunas excedido, tentando expandir...")
+                    # Força expansão com buffer maior
+                    self._expand_sheet_columns(col_index + self.expand_buffer * 2)
+                    self._values_update(f"{self.input_sheet}!{col}{header_row}", [[date_header]])
+                    logger.info(f"📅 Nova coluna criada após expansão: {col} ('{date_header}')")
+                else:
+                    raise
+        else:
+            logger.info(f"📅 Usando coluna existente: {col} ('{date_header}')")
+            
         return col, created
 
     def update_column_range_chunked(self, col: str, header_row: int, start_row: int, values_1col: List[object], chunk_size: int = 1000) -> None:
@@ -381,6 +457,10 @@ def main():
     chunk_size = int(os.getenv("CHUNK_SIZE", "1000"))
     sock_connect_timeout = float(os.getenv("SOCK_CONNECT_TIMEOUT", "30"))
     sock_read_timeout = float(os.getenv("SOCK_READ_TIMEOUT", "180"))
+    
+    # Novas configurações para expansão de colunas
+    auto_expand = os.getenv("AUTO_EXPAND_COLUMNS", "true").lower() == "true"
+    expand_buffer = int(os.getenv("EXPAND_BUFFER", "5"))
 
     logger.info("🚀 Iniciando Sistema de Verificação de Estoque Magento")
     logger.info(f"SPREADSHEET_ID: {mask(spreadsheet_id)}")
@@ -389,8 +469,15 @@ def main():
     logger.info(f"⚡ Max workers: {max_workers} | ⏱️ Rate limit: {rate_limit}s | 📈 MAX_STOCK: {max_stock}")
     logger.info(f"🧾 Incremental: {incremental} | FLUSH_EVERY={flush_every} | FLUSH_SECONDS={flush_seconds} | CHUNK_SIZE={chunk_size}")
     logger.info(f"⏳ Timeouts: connect={sock_connect_timeout}s, read={sock_read_timeout}s")
+    logger.info(f"📊 Auto-expand: {auto_expand} | Buffer: {expand_buffer} colunas")
 
-    sheets = GoogleSheetsUpdater(spreadsheet_id, creds_path)
+    sheets = GoogleSheetsUpdater(
+        spreadsheet_id, 
+        creds_path,
+        auto_expand=auto_expand,
+        expand_buffer=expand_buffer
+    )
+    
     products = sheets.read_products()
     if not products:
         logger.error("❌ Nenhum produto encontrado.")
