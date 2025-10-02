@@ -2,7 +2,7 @@
 """
 Sistema de Verificação de Estoque Magento/Adobe Commerce
 Entrada: aba Produtos (coluna B = SKU)
-Saída: aba Estoque (Família | SKU | Título | Data | Estoque)
+Saída: aba Estoque (SKU | Data | Estoque), sempre adicionando na última linha
 """
 
 import os
@@ -24,10 +24,7 @@ from googleapiclient.errors import HttpError
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(f"stock_check_{datetime.now().strftime('%Y%m%d')}.log"),
-    ],
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
 
@@ -37,12 +34,6 @@ def get_env(name: str, required: bool = True, default: Optional[str] = None) -> 
     if required and (val is None or str(val).strip() == ""):
         raise RuntimeError(f"Variável de ambiente obrigatória não encontrada: {name}")
     return val
-
-def mask(s: Optional[str], keep: int = 4) -> str:
-    if not s:
-        return "<vazio>"
-    s = str(s)
-    return s if len(s) <= keep else s[:keep] + "..."
 
 # ================== TENACITY HELPERS ==================
 GS_RETRIABLE_EXC = (HttpError, BrokenPipeError, OSError, ConnectionError, TimeoutError)
@@ -85,47 +76,42 @@ class GoogleSheetsUpdater:
         ).execute(num_retries=3)
 
     @_gs_retry()
-    def append_rows(self, rows: List[List[object]]):
-        """Adiciona linhas no formato longo na aba Estoque"""
-        return self.service.spreadsheets().values().append(
+    def _values_update(self, range_str: str, values: List[List[object]], valueInputOption="RAW"):
+        return self.service.spreadsheets().values().update(
             spreadsheetId=self.spreadsheet_id,
-            range=f"{self.estoque_sheet}!A:E",
-            valueInputOption="RAW",
-            insertDataOption="INSERT_ROWS",
-            body={"values": rows}
+            range=range_str,
+            valueInputOption=valueInputOption,
+            body={"values": values},
         ).execute(num_retries=3)
 
-    def read_products(self, header_row: int = 1) -> List[Dict]:
-        """
-        Lê SKUs da aba Produtos (coluna B obrigatória, opcionalmente A=Família, C=Título).
-        """
-        resp = self._values_get(f"{self.produtos_sheet}!A:C")
+    def get_last_row(self, sheet_name: str) -> int:
+        resp = self._values_get(f"{sheet_name}!A:A")
+        values = resp.get("values", [])
+        return len(values)
+
+    def read_products(self, header_row: int = 1) -> List[str]:
+        resp = self._values_get(f"{self.produtos_sheet}!B:B")
         values = resp.get("values", [])
         if not values or len(values) <= (header_row - 1):
-            logger.warning("Nenhum dado encontrado na aba Produtos.")
+            logger.warning("Nenhum SKU encontrado na aba Produtos.")
             return []
+        skus = [str(row[0]).strip() for row in values[header_row:] if row]
+        logger.info(f"🧾 SKUs lidos da aba '{self.produtos_sheet}': {len(skus)}")
+        return skus
 
-        headers = [str(h).strip().lower() for h in values[header_row - 1]]
+    def append_stocks(self, skus: List[str], stocks: List[int]):
+        """Adiciona SKU | Data | Estoque abaixo da última linha"""
+        data_hoje = datetime.utcnow().strftime("%Y-%m-%d")
+        linhas = [[sku, data_hoje, saldo] for sku, saldo in zip(skus, stocks)]
 
-        try:
-            sku_idx = headers.index("sku")
-        except ValueError:
-            raise RuntimeError("Coluna 'SKU' obrigatória não encontrada na aba Produtos.")
+        last_row = self.get_last_row(self.estoque_sheet)
+        start_row = last_row + 1 if last_row > 0 else 1
 
-        familia_idx = headers.index("família") if "família" in headers else None
-        titulo_idx = headers.index("título") if "título" in headers else None
-
-        products: List[Dict] = []
-        for row in values[header_row:]:
-            sku = str(row[sku_idx]).strip() if sku_idx < len(row) else ""
-            if sku:
-                products.append({
-                    "sku": sku,
-                    "familia": row[familia_idx] if familia_idx is not None and familia_idx < len(row) else "",
-                    "titulo": row[titulo_idx] if titulo_idx is not None and titulo_idx < len(row) else ""
-                })
-        logger.info(f"🧾 Produtos lidos da aba '{self.produtos_sheet}': {len(products)}")
-        return products
+        self._values_update(
+            f"{self.estoque_sheet}!A{start_row}:C{start_row+len(linhas)-1}",
+            linhas
+        )
+        logger.info(f"📝 {len(linhas)} linhas adicionadas em '{self.estoque_sheet}' a partir da linha {start_row}")
 
 # ================== MAGENTO STOCK CHECKER (ASYNC) ==================
 class AsyncMagentoStockChecker:
@@ -204,20 +190,20 @@ class AsyncMagentoStockChecker:
         finally:
             self.stats["processed"] += 1
 
-    async def process_all(self, products: List[Dict], sock_connect_timeout: float = 30, sock_read_timeout: float = 180) -> List[int]:
+    async def process_all(self, skus: List[str], sock_connect_timeout: float = 30, sock_read_timeout: float = 180) -> List[int]:
         self.stats["start_time"] = time.time()
         sem = asyncio.Semaphore(self._max_workers)
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=sock_connect_timeout, sock_read=sock_read_timeout)
         connector = aiohttp.TCPConnector(limit=0)
 
-        stocks: List[Optional[int]] = [None] * len(products)
+        stocks: List[Optional[int]] = [None] * len(skus)
 
         async with aiohttp.ClientSession(headers=self.headers, timeout=timeout, connector=connector) as session:
             async def runner(idx: int, sku: str):
                 val = await self.check_stock(session, sem, sku)
                 stocks[idx] = val
 
-            tasks = [asyncio.create_task(runner(i, p["sku"])) for i, p in enumerate(products)]
+            tasks = [asyncio.create_task(runner(i, sku)) for i, sku in enumerate(skus)]
             await asyncio.gather(*tasks)
 
         return [(x if x is not None else 0) for x in stocks]
@@ -236,14 +222,11 @@ def main():
     sock_read_timeout = float(os.getenv("SOCK_READ_TIMEOUT", "180"))
 
     logger.info("🚀 Iniciando Sistema de Verificação de Estoque Magento")
-    logger.info(f"SPREADSHEET_ID: {mask(spreadsheet_id)}")
-    logger.info(f"MAGENTO_BASE_URL: {magento_base_url}")
-    logger.info(f"⚡ Max workers: {max_workers} | ⏱️ Rate limit: {rate_limit}s | 📈 MAX_STOCK: {max_stock}")
 
     sheets = GoogleSheetsUpdater(spreadsheet_id, creds_path)
-    products = sheets.read_products()
-    if not products:
-        logger.error("❌ Nenhum produto encontrado na aba Produtos.")
+    skus = sheets.read_products()
+    if not skus:
+        logger.error("❌ Nenhum SKU encontrado na aba Produtos.")
         sys.exit(1)
 
     checker = AsyncMagentoStockChecker(
@@ -251,22 +234,8 @@ def main():
         rate_limit=rate_limit, max_stock=max_stock, max_workers=max_workers
     )
 
-    stocks = asyncio.run(checker.process_all(products, sock_connect_timeout, sock_read_timeout))
-
-    # Monta linhas no formato longo para a aba Estoque
-    data_hoje = datetime.utcnow().strftime("%Y-%m-%d")
-    linhas = []
-    for prod, saldo in zip(products, stocks):
-        linhas.append([
-            prod.get("familia", ""),
-            prod["sku"],
-            prod.get("titulo", ""),
-            data_hoje,
-            saldo
-        ])
-
-    sheets.append_rows(linhas)
-    logger.info(f"📝 {len(linhas)} linhas adicionadas em 'Estoque'")
+    stocks = asyncio.run(checker.process_all(skus, sock_connect_timeout, sock_read_timeout))
+    sheets.append_stocks(skus, stocks)
 
     elapsed = time.time() - checker.stats["start_time"]
     speed = checker.stats["processed"] / elapsed if elapsed > 0 else 0
