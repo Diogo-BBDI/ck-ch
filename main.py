@@ -84,6 +84,40 @@ class GoogleSheetsUpdater:
             body={"values": values},
         ).execute(num_retries=3)
 
+    @_gs_retry()
+    def _get_sheet_properties(self) -> Dict:
+        response = self.service.spreadsheets().get(spreadsheetId=self.spreadsheet_id).execute()
+        for sheet in response.get('sheets', []):
+            if sheet['properties']['title'] == self.estoque_sheet:
+                return sheet['properties']
+        raise RuntimeError(f"Sheet '{self.estoque_sheet}' não encontrada")
+
+    @_gs_retry()
+    def _expand_sheet_rows(self, new_row_count: int) -> None:
+        sheet_props = self._get_sheet_properties()
+        sheet_id = sheet_props['sheetId']
+        current_rows = sheet_props.get('gridProperties', {}).get('rowCount', 1000)
+
+        if new_row_count > current_rows:
+            request = {
+                "requests": [{
+                    "updateSheetProperties": {
+                        "properties": {
+                            "sheetId": sheet_id,
+                            "gridProperties": {
+                                "rowCount": new_row_count
+                            }
+                        },
+                        "fields": "gridProperties.rowCount"
+                    }
+                }]
+            }
+            self.service.spreadsheets().batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body=request
+            ).execute()
+            logger.info(f"🔧 Planilha expandida de {current_rows} para {new_row_count} linhas")
+
     def get_last_row(self, sheet_name: str) -> int:
         resp = self._values_get(f"{sheet_name}!A:A")
         values = resp.get("values", [])
@@ -106,6 +140,10 @@ class GoogleSheetsUpdater:
 
         last_row = self.get_last_row(self.estoque_sheet)
         start_row = last_row + 1 if last_row > 0 else 1
+
+        # 🔧 Garante que a planilha tenha linhas suficientes
+        needed_rows = start_row + len(linhas) + 10  # +10 buffer
+        self._expand_sheet_rows(needed_rows)
 
         self._values_update(
             f"{self.estoque_sheet}!A{start_row}:C{start_row+len(linhas)-1}",
